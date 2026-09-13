@@ -1,0 +1,21 @@
+[worldserver]
+
+WorldQuests.Enable = 1
+WorldQuests.Announce = 1
+WorldQuests.IncludeBots = 0
+
+# Legion-style overlapping cohorts: three quests per wave, each lasting 24 hours.
+WorldQuests.QuestsPerWave = 3
+WorldQuests.DurationHours = 24
+WorldQuests.BaseRefreshHours = 6
+WorldQuests.CooldownHours = 72
+WorldQuests.ActivationRadius = 200
+
+# Equal category weights by default: emblems, arena points, honor, and gold.
+WorldQuests.EmblemWeight = 1
+WorldQuests.ArenaWeight = 1
+WorldQuests.HonorWeight = 1
+WorldQuests.GoldWeight = 1
+
+# Comma-separated WotLK emblem item IDs: Frost, Triumph, Conquest, Valor, Heroism.
+WorldQuests.EmblemItems = "49426,47241,45624,40753,40752"

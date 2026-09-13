@@ -1,0 +1,22 @@
+[worldserver]
+
+# Enable the module.
+AutoLearn.Enable = 1
+
+# Learn all class spells that are available from class trainers.
+AutoLearn.TrainerSpells = 1
+
+# Learn permanent class abilities normally awarded by class quests.
+AutoLearn.QuestSpells = 1
+
+# Check existing characters for missed spells when they log in.
+AutoLearn.LoginCatchUp = 1
+
+# Give required class items such as the four shaman totems.
+AutoLearn.RequiredItems = 1
+
+# Notify the player when the module learns spells or gives required items.
+AutoLearn.Announce = 1
+
+# Apply AutoLearn to Playerbots. Disabled because Playerbots manages its own spells.
+AutoLearn.IncludeBots = 0

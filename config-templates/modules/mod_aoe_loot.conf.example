@@ -1,0 +1,4 @@
+AOELoot.Enable = 1
+AOELoot.Message = 1
+AOELoot.Range = 55.0
+AOELoot.Group = 1

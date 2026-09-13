@@ -1,0 +1,3 @@
+872cc9b236f1fd01028bcae84222dd988e6d132d63f0437fa18786b7da00b52b  WoWCruel-bin-v1.0.0.zip
+1a08cea20beda432265174422728de32adae0b3e8d21489850e84cb9e78a2291  WoWCruel-data-v1.0.0.zip
+c5780b71e188f272c10cf13e79fb782926de6af1af04ca86570ec772f9ceba05  WoWCruel-setup-and-source-v1.0.0.zip

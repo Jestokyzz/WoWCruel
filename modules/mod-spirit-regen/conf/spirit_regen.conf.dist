@@ -1,0 +1,32 @@
+[worldserver]
+
+# Enable the experimental Spirit-only mana regeneration model.
+SpiritRegen.Enable = 0
+
+# Recalculate at most once per this many milliseconds.
+SpiritRegen.UpdateIntervalMs = 500
+
+# One point of Spirit provides this much in-cast MP5.
+SpiritRegen.CombatMp5PerSpirit = 0.5
+
+# Keep the stronger of vanilla out-of-cast Spirit regeneration and normalized regeneration.
+SpiritRegen.PreserveVanillaOutOfCast = 1
+
+# Reject passive flat mana regeneration that was not converted to Spirit.
+# Seated food and drink restoration remains allowed.
+SpiritRegen.StrictMode = 1
+
+# Report blocked passive flat-regeneration auras in module debug logs.
+SpiritRegen.AuditUnknownFlatRegen = 1
+
+# Class multipliers (Warrior/Rogue/Death Knight are ignored because they do not use mana).
+SpiritRegen.PaladinMultiplier = 1.0
+SpiritRegen.HunterMultiplier = 1.0
+SpiritRegen.PriestMultiplier = 1.0
+SpiritRegen.ShamanMultiplier = 1.0
+SpiritRegen.MageMultiplier = 1.0
+SpiritRegen.WarlockMultiplier = 1.0
+SpiritRegen.DruidMultiplier = 1.0
+
+# Log every recalculation. Intended only for short test sessions.
+SpiritRegen.Debug = 0

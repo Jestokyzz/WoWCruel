@@ -1,0 +1,7 @@
+AutoLearn.Enable = 1
+AutoLearn.TrainerSpells = 1
+AutoLearn.QuestSpells = 1
+AutoLearn.LoginCatchUp = 1
+AutoLearn.RequiredItems = 1
+AutoLearn.Announce = 1
+AutoLearn.IncludeBots = 0

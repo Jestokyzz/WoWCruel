@@ -1,0 +1,11 @@
+{
+  "azerothcore": {
+    "url": "https://github.com/mod-playerbots/azerothcore-wotlk.git",
+    "commit": "092e9ba6ff8dc6d861dddd1f31baa9d404381a85"
+  },
+  "playerbots": {
+    "url": "https://github.com/mod-playerbots/mod-playerbots.git",
+    "commit": "2f7d9f774987d0157c6a0d0cc08c40bec3db3945"
+  },
+  "status": "source staging; SQL completeness, secret scan and bootstrap validation pending"
+}

@@ -1,0 +1,26 @@
+CREATE TABLE IF NOT EXISTS `character_world_quest` (
+  `guid` INT UNSIGNED NOT NULL,
+  `quest` INT UNSIGNED NOT NULL,
+  `state` TINYINT UNSIGNED NOT NULL DEFAULT 0,
+  `startsAt` INT UNSIGNED NOT NULL,
+  `expiresAt` INT UNSIGNED NOT NULL,
+  `rewardType` TINYINT UNSIGNED NOT NULL,
+  `rewardId` INT UNSIGNED NOT NULL DEFAULT 0,
+  `rewardAmount` INT UNSIGNED NOT NULL,
+  `rewardType2` TINYINT UNSIGNED NOT NULL DEFAULT 0,
+  `rewardId2` INT UNSIGNED NOT NULL DEFAULT 0,
+  `rewardAmount2` INT UNSIGNED NOT NULL DEFAULT 0,
+  `completedAt` INT UNSIGNED NOT NULL DEFAULT 0,
+  `progress0` INT UNSIGNED NOT NULL DEFAULT 0,
+  `progress1` INT UNSIGNED NOT NULL DEFAULT 0,
+  `progress2` INT UNSIGNED NOT NULL DEFAULT 0,
+  `progress3` INT UNSIGNED NOT NULL DEFAULT 0,
+  PRIMARY KEY (`guid`, `quest`),
+  KEY `idx_expiresAt` (`expiresAt`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `character_world_quest_schedule` (
+  `guid` INT UNSIGNED NOT NULL,
+  `nextWaveAt` INT UNSIGNED NOT NULL,
+  PRIMARY KEY (`guid`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

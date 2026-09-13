@@ -1,0 +1,9 @@
+-- Preflight jc-2026-08-28-queldanas-v1
+SELECT DATABASE() AS `target_database`;
+SELECT 'production_id_collisions' AS `check_name`,
+       (SELECT COUNT(*) FROM `item_template` WHERE `entry` BETWEEN 900300 AND 900315) +
+       (SELECT COUNT(*) FROM `creature_template` WHERE `entry` BETWEEN 900400 AND 900405) AS `failures`;
+SELECT 'source_counts' AS `check_name`,
+       (SELECT COUNT(*) FROM `creature_template` WHERE `entry` IN (5202,6491,24938,25115,25953,9521)) AS `creature_sources_expected_6`,
+       (SELECT COUNT(*) FROM `quest_template` WHERE `ID` IN (11481,11482,11488,11492,11496,11520,11521,11523,11524,11525,11526,11532,11533,11535,11536,11537,11538,11539,11540,11541,11542,11543,11544,11545,11546,11547,11548,11549,11550,11554,11555,11556,11557,24522,24535,24553,24562,24563,24564,24594,24595,24596,24598)) AS `quests_expected_43`,
+       (SELECT COUNT(*) FROM `npc_vendor` WHERE `entry`=25032 AND `item` IN (34665,34666,34667,34670,34671,34672,34673,34674,34675,34676,34677,34678,34679,34680,35221)) AS `eldara_equipment_expected_15`;

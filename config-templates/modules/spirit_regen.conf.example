@@ -1,0 +1,14 @@
+SpiritRegen.Enable = 1
+SpiritRegen.UpdateIntervalMs = 500
+SpiritRegen.CombatMp5PerSpirit = 0.5
+SpiritRegen.PreserveVanillaOutOfCast = 1
+SpiritRegen.StrictMode = 1
+SpiritRegen.AuditUnknownFlatRegen = 1
+SpiritRegen.PaladinMultiplier = 1.0
+SpiritRegen.HunterMultiplier = 1.0
+SpiritRegen.PriestMultiplier = 1.0
+SpiritRegen.ShamanMultiplier = 1.0
+SpiritRegen.MageMultiplier = 1.0
+SpiritRegen.WarlockMultiplier = 1.0
+SpiritRegen.DruidMultiplier = 1.0
+SpiritRegen.Debug = 0

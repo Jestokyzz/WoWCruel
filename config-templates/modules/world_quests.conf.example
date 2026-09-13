@@ -1,0 +1,13 @@
+WorldQuests.Enable = 1
+WorldQuests.Announce = 1
+WorldQuests.IncludeBots = 0
+WorldQuests.QuestsPerWave = 3
+WorldQuests.DurationHours = 24
+WorldQuests.BaseRefreshHours = 6
+WorldQuests.CooldownHours = 72
+WorldQuests.ActivationRadius = 200
+WorldQuests.EmblemWeight = 1
+WorldQuests.ArenaWeight = 1
+WorldQuests.HonorWeight = 1
+WorldQuests.GoldWeight = 1
+WorldQuests.EmblemItems = "49426,47241,45624,40753,40752"

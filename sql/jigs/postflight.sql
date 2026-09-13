@@ -1,0 +1,1 @@
+SELECT v.item,v.maxcount,v.ExtendedCost,t.BuyPrice,t.SellPrice,t.maxcount FROM npc_vendor v JOIN item_template t ON t.entry=v.item WHERE v.entry=900500 ORDER BY v.slot;

@@ -1,0 +1,3806 @@
+diff --git a/src/server/database/Database/Implementation/CharacterDatabase.cpp b/src/server/database/Database/Implementation/CharacterDatabase.cpp
+index 419a6ce78..d810f12a6 100644
+--- a/src/server/database/Database/Implementation/CharacterDatabase.cpp
++++ b/src/server/database/Database/Implementation/CharacterDatabase.cpp
+@@ -23,6 +23,20 @@ void CharacterDatabaseConnection::DoPrepareStatements()
+     if (!m_reconnecting)
+         m_stmts.resize(MAX_CHARACTERDATABASE_STATEMENTS);
+ 
++    PrepareStatement(CHAR_INS_HARDCORE_ATTEMPT,
++        "INSERT INTO character_hardcore_attempt (guid, account, rules_version, profile, state, started_at, start_level, pact_mask, pact_version) "
++        "VALUES (?, ?, 1, 0, 1, UNIX_TIMESTAMP(), ?, ?, 1)", CONNECTION_BOTH);
++    // Aggregate always returns a row; a null result is a database failure, not an ordinary character.
++    PrepareStatement(CHAR_SEL_HARDCORE_ATTEMPT,
++        "SELECT COUNT(*), MAX(state), MAX(rules_version), MAX(account), MAX(pact_mask), MAX(pact_version) "
++        "FROM character_hardcore_attempt WHERE guid = ?", CONNECTION_SYNCH);
++    PrepareStatement(CHAR_UPD_HARDCORE_DEATH,
++        "UPDATE character_hardcore_attempt SET state=2, death_level=?, death_map=?, death_zone=?, "
++        "ended_at=?, played_seconds=? WHERE guid=? AND account=? AND state=1", CONNECTION_SYNCH);
++    PrepareStatement(CHAR_UPD_HARDCORE_LEAVE,
++        "UPDATE character_hardcore_attempt SET state=CASE WHEN state=1 THEN 4 ELSE 3 END, "
++        "released_at=UNIX_TIMESTAMP() WHERE guid=? AND account=? AND state IN (1,2)", CONNECTION_SYNCH);
++
+     PrepareStatement(CHAR_DEL_QUEST_POOL_SAVE, "DELETE FROM pool_quest_save WHERE pool_id = ?", CONNECTION_ASYNC);
+     PrepareStatement(CHAR_INS_QUEST_POOL_SAVE, "INSERT INTO pool_quest_save (pool_id, quest_id) VALUES (?, ?)", CONNECTION_ASYNC);
+     PrepareStatement(CHAR_DEL_NONEXISTENT_GUILD_BANK_ITEM, "DELETE FROM guild_bank_item WHERE guildid = ? AND TabId = ? AND SlotId = ?", CONNECTION_ASYNC);
+@@ -609,6 +623,22 @@ void CharacterDatabaseConnection::DoPrepareStatements()
+ 
+     PrepareStatement(CHAR_SEL_HONORPOINTS, "SELECT totalHonorPoints FROM characters WHERE guid = ?", CONNECTION_SYNCH);
+     PrepareStatement(CHAR_SEL_ARENAPOINTS, "SELECT arenaPoints FROM characters WHERE guid = ?", CONNECTION_SYNCH);
++    PrepareStatement(CHAR_SEL_SOLO_ARENA_RATING_BY_GUID_SLOT,
++        "SELECT rating, matchmaker_rating, virtual_team_id FROM character_solo_arena_rating WHERE guid = ? AND arena_slot = ?",
++        CONNECTION_SYNCH);
++    PrepareStatement(CHAR_INS_SOLO_ARENA_RATING,
++        "INSERT IGNORE INTO character_solo_arena_rating (guid, arena_slot, rating, matchmaker_rating, virtual_team_id) VALUES (?, ?, ?, ?, ?)",
++        CONNECTION_ASYNC);
++    PrepareStatement(CHAR_SEL_SOLO_ARENA_RATING_BY_VIRTUAL_TEAM,
++        "SELECT rating, matchmaker_rating FROM character_solo_arena_rating WHERE virtual_team_id = ?", CONNECTION_SYNCH);
++    PrepareStatement(CHAR_UPD_SOLO_ARENA_RATING_RESULT,
++        "UPDATE character_solo_arena_rating SET rating = ?, matchmaker_rating = ?, week_games = week_games + 1, "
++        "season_games = season_games + 1, week_wins = week_wins + ?, season_wins = season_wins + ? WHERE virtual_team_id = ?",
++        CONNECTION_ASYNC);
++    PrepareStatement(CHAR_SEL_SOLO_ARENA_WEEKLY_POINTS,
++        "SELECT guid, arena_slot, rating FROM character_solo_arena_rating WHERE week_games >= 10", CONNECTION_SYNCH);
++    PrepareStatement(CHAR_UPD_SOLO_ARENA_FINISH_WEEK,
++        "UPDATE character_solo_arena_rating SET week_games = 0, week_wins = 0", CONNECTION_ASYNC);
+ 
+     // Character names
+     PrepareStatement(CHAR_INS_RESERVED_PLAYER_NAME, "INSERT IGNORE INTO reserved_name (name) VALUES (?)", CONNECTION_ASYNC);
+diff --git a/src/server/database/Database/Implementation/CharacterDatabase.h b/src/server/database/Database/Implementation/CharacterDatabase.h
+index cbdfbdcb3..3cfbe1702 100644
+--- a/src/server/database/Database/Implementation/CharacterDatabase.h
++++ b/src/server/database/Database/Implementation/CharacterDatabase.h
+@@ -524,6 +524,13 @@ enum CharacterDatabaseStatements : uint32
+     CHAR_SEL_HONORPOINTS,
+     CHAR_SEL_ARENAPOINTS,
+ 
++    CHAR_SEL_SOLO_ARENA_RATING_BY_GUID_SLOT,
++    CHAR_INS_SOLO_ARENA_RATING,
++    CHAR_SEL_SOLO_ARENA_RATING_BY_VIRTUAL_TEAM,
++    CHAR_UPD_SOLO_ARENA_RATING_RESULT,
++    CHAR_SEL_SOLO_ARENA_WEEKLY_POINTS,
++    CHAR_UPD_SOLO_ARENA_FINISH_WEEK,
++
+     CHAR_INS_RESERVED_PLAYER_NAME,
+     CHAR_INS_PROFANITY_PLAYER_NAME,
+ 
+@@ -546,6 +553,11 @@ enum CharacterDatabaseStatements : uint32
+ 
+     CHAR_NO_OP_PROVIDE_REALM_CONTEXT,
+ 
++    CHAR_INS_HARDCORE_ATTEMPT,
++    CHAR_SEL_HARDCORE_ATTEMPT,
++    CHAR_UPD_HARDCORE_DEATH,
++    CHAR_UPD_HARDCORE_LEAVE,
++
+     MAX_CHARACTERDATABASE_STATEMENTS
+ };
+ 
+diff --git a/src/server/game/Accounts/RBAC.h b/src/server/game/Accounts/RBAC.h
+index 58481ef8d..16dda41d2 100644
+--- a/src/server/game/Accounts/RBAC.h
++++ b/src/server/game/Accounts/RBAC.h
+@@ -707,6 +707,7 @@ enum RBACPermissions
+     RBAC_PERM_COMMAND_ACCOUNT_FLAG_ADD                       = 943,
+     RBAC_PERM_COMMAND_ACCOUNT_FLAG_REMOVE                    = 944,
+     // custom permissions 1000+
++    RBAC_PERM_COMMAND_SOLITARY                               = 1000,
+     RBAC_PERM_MAX
+ };
+ 
+diff --git a/src/server/game/Battlegrounds/Arena.cpp b/src/server/game/Battlegrounds/Arena.cpp
+index fffa1b062..06aad209c 100644
+--- a/src/server/game/Battlegrounds/Arena.cpp
++++ b/src/server/game/Battlegrounds/Arena.cpp
+@@ -29,6 +29,59 @@
+ #include "WorldStateDefines.h"
+ #include "WorldStatePackets.h"
+ 
++namespace
++{
++constexpr uint32 SOLO_RATED_ARENA_TEAM_ID_BASE = 0xF0000000;
++
++struct SoloRatedArenaRating
++{
++    bool Valid = false;
++    uint32 Rating = 1500;
++    uint32 MatchmakerRating = 1500;
++};
++
++bool IsSoloRatedArenaTeam(uint32 teamId)
++{
++    return teamId >= SOLO_RATED_ARENA_TEAM_ID_BASE;
++}
++
++SoloRatedArenaRating LoadSoloRatedArenaRating(uint32 teamId)
++{
++    SoloRatedArenaRating result;
++    if (!IsSoloRatedArenaTeam(teamId))
++        return result;
++
++    CharacterDatabasePreparedStatement* statement =
++        CharacterDatabase.GetPreparedStatement(CHAR_SEL_SOLO_ARENA_RATING_BY_VIRTUAL_TEAM);
++    statement->SetData(0, teamId);
++    if (PreparedQueryResult query = CharacterDatabase.Query(statement))
++    {
++        Field* fields = query->Fetch();
++        result.Valid = true;
++        result.Rating = fields[0].Get<uint32>();
++        result.MatchmakerRating = fields[1].Get<uint32>();
++    }
++    return result;
++}
++
++uint32 ApplyArenaRatingChange(uint32 rating, int32 change)
++{
++    return change < 0 && uint32(-change) > rating ? 0 : uint32(int64(rating) + change);
++}
++
++void SaveSoloRatedArenaRating(uint32 teamId, uint32 rating, uint32 matchmakerRating, bool won)
++{
++    CharacterDatabasePreparedStatement* statement =
++        CharacterDatabase.GetPreparedStatement(CHAR_UPD_SOLO_ARENA_RATING_RESULT);
++    statement->SetData(0, rating);
++    statement->SetData(1, matchmakerRating);
++    statement->SetData(2, won ? 1 : 0);
++    statement->SetData(3, won ? 1 : 0);
++    statement->SetData(4, teamId);
++    CharacterDatabase.Execute(statement);
++}
++}
++
+ void ArenaScore::AppendToPacket(WorldPacket& data)
+ {
+     data << PlayerGuid;
+@@ -220,8 +273,14 @@ void Arena::EndBattleground(TeamId winnerTeamId)
+         int32  winnerChange = 0;
+         int32  winnerMatchmakerChange = 0;
+ 
+-        ArenaTeam* winnerArenaTeam = sArenaTeamMgr->GetArenaTeamById(GetArenaTeamIdForTeam(winnerTeamId == TEAM_NEUTRAL ? TEAM_HORDE : winnerTeamId));
+-        ArenaTeam* loserArenaTeam  = sArenaTeamMgr->GetArenaTeamById(GetArenaTeamIdForTeam(winnerTeamId == TEAM_NEUTRAL ? TEAM_ALLIANCE : GetOtherTeamId(winnerTeamId)));
++        TeamId winnerSide = winnerTeamId == TEAM_NEUTRAL ? TEAM_HORDE : winnerTeamId;
++        TeamId loserSide = winnerTeamId == TEAM_NEUTRAL ? TEAM_ALLIANCE : GetOtherTeamId(winnerTeamId);
++        uint32 winnerArenaTeamId = GetArenaTeamIdForTeam(winnerSide);
++        uint32 loserArenaTeamId = GetArenaTeamIdForTeam(loserSide);
++        ArenaTeam* winnerArenaTeam = sArenaTeamMgr->GetArenaTeamById(winnerArenaTeamId);
++        ArenaTeam* loserArenaTeam  = sArenaTeamMgr->GetArenaTeamById(loserArenaTeamId);
++        SoloRatedArenaRating winnerSoloRating = LoadSoloRatedArenaRating(winnerArenaTeamId);
++        SoloRatedArenaRating loserSoloRating = LoadSoloRatedArenaRating(loserArenaTeamId);
+ 
+         auto SaveArenaLogs = [&]()
+         {
+@@ -234,8 +293,8 @@ void Arena::EndBattleground(TeamId winnerTeamId)
+             stmt2->SetData(0, fightId);
+             stmt2->SetData(1, GetArenaType());
+             stmt2->SetData(2, ((GetStartTime() <= startDelay ? 0 : GetStartTime() - startDelay) / 1000));
+-            stmt2->SetData(3, winnerArenaTeam->GetId());
+-            stmt2->SetData(4, loserArenaTeam->GetId());
++            stmt2->SetData(3, winnerArenaTeamId);
++            stmt2->SetData(4, loserArenaTeamId);
+             stmt2->SetData(5, (uint16)winnerTeamRating);
+             stmt2->SetData(6, (uint16)winnerMatchmakerRating);
+             stmt2->SetData(7, (int16)winnerChange);
+@@ -323,6 +382,63 @@ void Arena::EndBattleground(TeamId winnerTeamId)
+                 loserArenaTeam->FinishGame(ARENA_TIMELIMIT_POINTS_LOSS, GetBgMap());
+             }
+         }
++        else if (winnerTeamId != TEAM_NEUTRAL &&
++            (winnerSoloRating.Valid || winnerArenaTeam) && (loserSoloRating.Valid || loserArenaTeam) &&
++            winnerArenaTeamId != loserArenaTeamId)
++        {
++            // JestokyCraft rated groups use a persistent virtual team id for
++            // the real player's party. The opponent remains a normal bot
++            // ArenaTeam, so use the stock formula while persisting the virtual
++            // side in character_solo_arena_rating.
++            ArenaTeam* ratingCalculator = winnerArenaTeam ? winnerArenaTeam : loserArenaTeam;
++            winnerTeamRating = winnerArenaTeam ? winnerArenaTeam->GetRating() : winnerSoloRating.Rating;
++            loserTeamRating = loserArenaTeam ? loserArenaTeam->GetRating() : loserSoloRating.Rating;
++            winnerMatchmakerRating = winnerArenaTeam ? GetArenaMatchmakerRating(winnerSide) : winnerSoloRating.MatchmakerRating;
++            loserMatchmakerRating = loserArenaTeam ? GetArenaMatchmakerRating(loserSide) : loserSoloRating.MatchmakerRating;
++
++            if (winnerArenaTeam)
++                winnerMatchmakerChange = bValidArena
++                    ? winnerArenaTeam->WonAgainst(winnerMatchmakerRating, loserMatchmakerRating, winnerChange, GetBgMap()) : 0;
++            else if (bValidArena)
++            {
++                winnerChange = ratingCalculator->GetRatingMod(winnerTeamRating, loserMatchmakerRating, true);
++                winnerMatchmakerChange = ratingCalculator->GetMatchmakerRatingMod(
++                    winnerMatchmakerRating, loserMatchmakerRating, true);
++            }
++
++            if (loserArenaTeam)
++                loserMatchmakerChange = loserArenaTeam->LostAgainst(
++                    loserMatchmakerRating, winnerMatchmakerRating, loserChange, GetBgMap());
++            else
++            {
++                loserChange = ratingCalculator->GetRatingMod(loserTeamRating, winnerMatchmakerRating, false);
++                loserMatchmakerChange = ratingCalculator->GetMatchmakerRatingMod(
++                    loserMatchmakerRating, winnerMatchmakerRating, false);
++            }
++
++            if (winnerSoloRating.Valid && bValidArena)
++                SaveSoloRatedArenaRating(winnerArenaTeamId, ApplyArenaRatingChange(winnerTeamRating, winnerChange),
++                    ApplyArenaRatingChange(winnerMatchmakerRating, winnerMatchmakerChange), true);
++            if (loserSoloRating.Valid)
++                SaveSoloRatedArenaRating(loserArenaTeamId, ApplyArenaRatingChange(loserTeamRating, loserChange),
++                    ApplyArenaRatingChange(loserMatchmakerRating, loserMatchmakerChange), false);
++
++            SetArenaMatchmakerRating(winnerSide, ApplyArenaRatingChange(winnerMatchmakerRating, winnerMatchmakerChange));
++            SetArenaMatchmakerRating(loserSide, ApplyArenaRatingChange(loserMatchmakerRating, loserMatchmakerChange));
++
++            uint8 winnerScore = winnerSide == TEAM_ALLIANCE ? PVP_TEAM_ALLIANCE : PVP_TEAM_HORDE;
++            uint8 loserScore = winnerSide == TEAM_ALLIANCE ? PVP_TEAM_HORDE : PVP_TEAM_ALLIANCE;
++            _arenaTeamScores[winnerScore].Assign(winnerChange, winnerMatchmakerRating,
++                winnerArenaTeam ? winnerArenaTeam->GetName() : "JestokyCraft Solo");
++            _arenaTeamScores[loserScore].Assign(loserChange, loserMatchmakerRating,
++                loserArenaTeam ? loserArenaTeam->GetName() : "JestokyCraft Solo");
++
++            LOG_INFO("bg.arena",
++                "Solo rated result: type {} winner team {} rating {} ({:+}) MMR {} ({:+}); loser team {} rating {} ({:+}) MMR {} ({:+})",
++                GetArenaType(), winnerArenaTeamId, winnerTeamRating, winnerChange, winnerMatchmakerRating,
++                winnerMatchmakerChange, loserArenaTeamId, loserTeamRating, loserChange, loserMatchmakerRating,
++                loserMatchmakerChange);
++        }
+ 
+         SaveArenaLogs();
+ 
+@@ -361,23 +477,58 @@ void Arena::EndBattleground(TeamId winnerTeamId)
+                     player->ResetAchievementCriteria(ACHIEVEMENT_CRITERIA_CONDITION_NO_LOSE, 0);
+                 }
+ 
++                player->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_PLAY_ARENA, GetMapId());
++            }
++            else if ((winnerSoloRating.Valid || loserSoloRating.Valid) &&
++                (winnerArenaTeam || loserArenaTeam) && winnerArenaTeamId != loserArenaTeamId)
++            {
++                bool won = bgTeamId == winnerSide;
++                ArenaTeam* ordinaryTeam = won ? winnerArenaTeam : loserArenaTeam;
++
++                if (ordinaryTeam)
++                {
++                    if (won)
++                    {
++                        if (bValidArena && sScriptMgr->OnBeforeArenaTeamMemberUpdate(
++                            ordinaryTeam, player, true, loserMatchmakerRating, winnerMatchmakerChange))
++                            ordinaryTeam->MemberWon(player, loserMatchmakerRating, winnerMatchmakerChange);
++                    }
++                    else if (sScriptMgr->OnBeforeArenaTeamMemberUpdate(
++                        ordinaryTeam, player, false, winnerMatchmakerRating, loserMatchmakerChange))
++                        ordinaryTeam->MemberLost(player, winnerMatchmakerRating, loserMatchmakerChange);
++                }
++
++                if (won && bValidArena)
++                {
++                    player->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_WIN_RATED_ARENA,
++                        winnerSoloRating.Valid ? winnerSoloRating.Rating : winnerTeamRating);
++                    player->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_WIN_ARENA, GetMapId(), 0, player);
++                }
++                else if (!won)
++                    player->ResetAchievementCriteria(ACHIEVEMENT_CRITERIA_CONDITION_NO_LOSE, 0);
++
+                 player->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_PLAY_ARENA, GetMapId());
+             }
+         }
+ 
+-        // update previous opponents for arena queue
+-        winnerArenaTeam->SetPreviousOpponents(loserArenaTeam->GetId());
+-        loserArenaTeam->SetPreviousOpponents(winnerArenaTeam->GetId());
++        // update previous opponents for ordinary arena teams
++        if (winnerArenaTeam)
++            winnerArenaTeam->SetPreviousOpponents(loserArenaTeamId);
++        if (loserArenaTeam)
++            loserArenaTeam->SetPreviousOpponents(winnerArenaTeamId);
+ 
+         // save the stat changes
+-        if (bValidArena)
++        if (bValidArena && winnerArenaTeam)
+         {
+             winnerArenaTeam->SaveToDB();
+             winnerArenaTeam->NotifyStatsChanged();
+         }
+ 
+-        loserArenaTeam->SaveToDB();
+-        loserArenaTeam->NotifyStatsChanged();
++        if (loserArenaTeam)
++        {
++            loserArenaTeam->SaveToDB();
++            loserArenaTeam->NotifyStatsChanged();
++        }
+     }
+ 
+     // end battleground
+diff --git a/src/server/game/Battlegrounds/ArenaTeamMgr.cpp b/src/server/game/Battlegrounds/ArenaTeamMgr.cpp
+index b3fb4d71a..3a82e4d15 100644
+--- a/src/server/game/Battlegrounds/ArenaTeamMgr.cpp
++++ b/src/server/game/Battlegrounds/ArenaTeamMgr.cpp
+@@ -16,6 +16,7 @@
+  */
+ 
+ #include "ArenaTeamMgr.h"
++#include "ArenaSeasonMgr.h"
+ #include "Chat.h"
+ #include "DatabaseEnv.h"
+ #include "Define.h"
+@@ -26,6 +27,34 @@
+ #include "ScriptMgr.h"
+ #include "World.h"
+ 
++#include <algorithm>
++#include <cmath>
++
++namespace
++{
++uint32 GetSoloArenaPoints(uint32 rating, uint8 arenaSlot)
++{
++    float points;
++    if (rating <= 1500)
++    {
++        if (sArenaSeasonMgr->GetCurrentSeason() < 6 && !sWorld->getIntConfig(CONFIG_LEGACY_ARENA_POINTS_CALC))
++            points = float(rating) * 0.22f + 14.0f;
++        else
++            points = 344.0f;
++    }
++    else
++        points = 1511.26f / (1.0f + 1639.28f * std::exp(-0.00412f * float(rating)));
++
++    if (arenaSlot == 0)
++        points *= sWorld->getRate(RATE_ARENA_POINTS_2V2);
++    else if (arenaSlot == 1)
++        points *= sWorld->getRate(RATE_ARENA_POINTS_3V3);
++
++    points *= sWorld->getRate(RATE_ARENA_POINTS);
++    return uint32(points);
++}
++}
++
+ ArenaTeamMgr::ArenaTeamMgr()
+ {
+     NextArenaTeamId = 1;
+@@ -231,6 +260,21 @@ void ArenaTeamMgr::DistributeArenaPoints()
+             sScriptMgr->OnBeforeUpdateArenaPoints(at, PlayerPoints);
+         }
+ 
++    CharacterDatabasePreparedStatement* soloPointsStatement =
++        CharacterDatabase.GetPreparedStatement(CHAR_SEL_SOLO_ARENA_WEEKLY_POINTS);
++    if (PreparedQueryResult result = CharacterDatabase.Query(soloPointsStatement))
++    {
++        do
++        {
++            Field* fields = result->Fetch();
++            ObjectGuid guid = ObjectGuid::Create<HighGuid::Player>(fields[0].Get<uint32>());
++            uint32 points = GetSoloArenaPoints(fields[2].Get<uint32>(), fields[1].Get<uint8>());
++            auto [iterator, inserted] = PlayerPoints.try_emplace(guid, points);
++            if (!inserted)
++                iterator->second = std::max(iterator->second, points);
++        } while (result->NextRow());
++    }
++
+     CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+ 
+     CharacterDatabasePreparedStatement* stmt;
+@@ -252,6 +296,10 @@ void ArenaTeamMgr::DistributeArenaPoints()
+ 
+     CharacterDatabase.CommitTransaction(trans);
+ 
++    CharacterDatabasePreparedStatement* finishSoloWeek =
++        CharacterDatabase.GetPreparedStatement(CHAR_UPD_SOLO_ARENA_FINISH_WEEK);
++    CharacterDatabase.Execute(finishSoloWeek);
++
+     PlayerPoints.clear();
+ 
+     ChatHandler(nullptr).SendWorldText(LANG_DIST_ARENA_POINTS_ONLINE_END);
+diff --git a/src/server/game/Battlegrounds/Battleground.h b/src/server/game/Battlegrounds/Battleground.h
+index 9fe68bf3d..fada00ae1 100644
+--- a/src/server/game/Battlegrounds/Battleground.h
++++ b/src/server/game/Battlegrounds/Battleground.h
+@@ -413,6 +413,10 @@ public:
+     [[nodiscard]] bool isArena() const        { return m_IsArena; }
+     [[nodiscard]] bool isBattleground() const { return !m_IsArena; }
+     [[nodiscard]] bool isRated() const        { return m_IsRated; }
++    [[nodiscard]] bool IsSolitaryCohort() const { return m_HasSolitaryPlayer; }
++    [[nodiscard]] bool HasStandardPlayerCohort() const { return m_HasStandardPlayer; }
++    void RegisterSolitaryCohort() { m_HasSolitaryPlayer = true; }
++    void RegisterStandardPlayerCohort() { m_HasStandardPlayer = true; }
+ 
+     typedef std::map<ObjectGuid, Player*> BattlegroundPlayerMap;
+     [[nodiscard]] BattlegroundPlayerMap const& GetPlayers() const { return m_Players; }
+@@ -673,6 +677,8 @@ private:
+     PvPTeamId m_WinnerId;
+     int32  m_StartDelayTime;
+     bool   m_IsRated;                                   // is this battle rated?
++    bool   m_HasSolitaryPlayer{ false };                // bot-only cohort contains its single real player
++    bool   m_HasStandardPlayer{ false };                // ordinary real players were invited to this instance
+     bool   m_PrematureCountDown;
+     uint32 m_PrematureCountDownTimer;
+     std::string m_Name{};
+diff --git a/src/server/game/Battlegrounds/BattlegroundQueue.cpp b/src/server/game/Battlegrounds/BattlegroundQueue.cpp
+index ad2c7c95e..e321a8c31 100644
+--- a/src/server/game/Battlegrounds/BattlegroundQueue.cpp
++++ b/src/server/game/Battlegrounds/BattlegroundQueue.cpp
+@@ -27,12 +27,74 @@
+ #include "Language.h"
+ #include "Log.h"
+ #include "ObjectMgr.h"
++#include "ObjectAccessor.h"
+ #include "Player.h"
+ #include "ScriptMgr.h"
++#include "WorldSession.h"
+ #include <unordered_map>
+ 
+ #include "BattlegroundUtils.h"
+ 
++namespace
++{
++bool IsSolitaryRatedBotPair(GroupQueueInfo const* first, GroupQueueInfo const* second);
++
++bool QueueGroupsCanShareMatch(GroupQueueInfo const* first, GroupQueueInfo const* second)
++{
++    if (!first || !second)
++        return false;
++
++    // Rated Solitary arenas are private, owner-bound lobbies.  Never let an
++    // unrelated or incomplete legacy bot team satisfy such a queue.
++    if ((first->IsSolitary || second->IsSolitary) && first->IsRated && second->IsRated &&
++        first->ArenaType && second->ArenaType)
++        return IsSolitaryRatedBotPair(first, second);
++
++    if (first->IsSolitary)
++        return !second->HasRealPlayer;
++
++    if (second->IsSolitary)
++        return !first->HasRealPlayer;
++
++    return true;
++}
++
++bool IsSolitaryRatedBotPair(GroupQueueInfo const* first, GroupQueueInfo const* second)
++{
++    if (!first || !second)
++        return false;
++
++    if (!first->IsSolitary || !second->IsSolitary || !first->IsRated || !second->IsRated ||
++        !first->ArenaType || first->ArenaType != second->ArenaType ||
++        first->Players.size() != first->ArenaType || second->Players.size() != second->ArenaType ||
++        !first->SolitaryOwnerGuid || first->SolitaryOwnerGuid != second->SolitaryOwnerGuid ||
++        first->HasRealPlayer == second->HasRealPlayer)
++        return false;
++
++    GroupQueueInfo const* solitary = first->IsSolitary && first->HasRealPlayer ? first :
++        second->IsSolitary && second->HasRealPlayer ? second : nullptr;
++    GroupQueueInfo const* bots = solitary == first ? second : first;
++    return solitary && bots && bots->IsSolitary && !bots->HasRealPlayer;
++}
++
++void NormalizeSolitaryRatedBotMmr(GroupQueueInfo* first, GroupQueueInfo* second)
++{
++    if (!IsSolitaryRatedBotPair(first, second))
++        return;
++
++    GroupQueueInfo* solitary = first->IsSolitary && first->HasRealPlayer ? first : second;
++    GroupQueueInfo* bots = solitary == first ? second : first;
++    uint32 const storedBotMmr = bots->ArenaMatchmakerRating;
++    bots->ArenaMatchmakerRating = solitary->ArenaMatchmakerRating;
++
++    LOG_INFO("bg.arena",
++        "Solitary rated queue: virtual team {} (MMR {}) paired with bot-only team {} "
++        "(stored MMR {}, effective MMR {})",
++        solitary->ArenaTeamId, solitary->ArenaMatchmakerRating, bots->ArenaTeamId,
++        storedBotMmr, bots->ArenaMatchmakerRating);
++}
++}
++
+ /*********************************************************/
+ /***            BATTLEGROUND QUEUE SYSTEM              ***/
+ /*********************************************************/
+@@ -152,6 +214,9 @@ GroupQueueInfo* BattlegroundQueue::AddGroup(Player* leader, Group* group, Battle
+     ginfo->PreviousOpponentsTeamId      = opponentsArenaTeamId;
+     ginfo->OpponentsTeamRating          = 0;
+     ginfo->OpponentsMatchmakerRating    = 0;
++    ginfo->IsSolitary                   = false;
++    ginfo->HasRealPlayer                = false;
++    ginfo->SolitaryOwnerGuid            = 0;
+ 
+     ginfo->Players.clear();
+ 
+@@ -181,6 +246,15 @@ GroupQueueInfo* BattlegroundQueue::AddGroup(Player* leader, Group* group, Battle
+             ASSERT(m_QueuedPlayers.count(member->GetGUID()) == 0);
+             m_QueuedPlayers[member->GetGUID()] = ginfo;
+             ginfo->Players.emplace(member->GetGUID());
++            ginfo->IsSolitary = ginfo->IsSolitary || member->IsSolitary() || member->IsSolitaryActivityBot();
++            ginfo->HasRealPlayer = ginfo->HasRealPlayer ||
++                (member->GetSession() && !member->GetSession()->IsBot());
++            ObjectGuid::LowType const ownerGuid = member->IsSolitary() ? member->GetGUID().GetCounter() :
++                member->GetSolitaryActivityOwnerGuid();
++            if (ownerGuid && !ginfo->SolitaryOwnerGuid)
++                ginfo->SolitaryOwnerGuid = ownerGuid;
++            else if (ownerGuid && ginfo->SolitaryOwnerGuid != ownerGuid)
++                LOG_ERROR("bg.matchmaking", "Mixed Solitary owners detected while adding an arena queue group");
+         });
+     }
+     else
+@@ -188,6 +262,10 @@ GroupQueueInfo* BattlegroundQueue::AddGroup(Player* leader, Group* group, Battle
+         ASSERT(m_QueuedPlayers.count(leader->GetGUID()) == 0);
+         m_QueuedPlayers[leader->GetGUID()] = ginfo;
+         ginfo->Players.emplace(leader->GetGUID());
++        ginfo->IsSolitary = leader->IsSolitary() || leader->IsSolitaryActivityBot();
++        ginfo->HasRealPlayer = leader->GetSession() && !leader->GetSession()->IsBot();
++        ginfo->SolitaryOwnerGuid = leader->IsSolitary() ? leader->GetGUID().GetCounter() :
++            leader->GetSolitaryActivityOwnerGuid();
+     }
+ 
+     //add GroupInfo to m_QueuedGroups
+@@ -414,6 +492,28 @@ void BattlegroundQueue::FillPlayersToBG(Battleground* bg, BattlegroundBracketId
+         return;
+     }
+ 
++    // A human entering a bot-populated queue must be selected before waiting
++    // bot groups. list::sort is stable, so FIFO order is retained within the
++    // human and bot partitions.
++    auto containsRealPlayer = [](GroupQueueInfo const* groupInfo)
++    {
++        for (ObjectGuid const& guid : groupInfo->Players)
++        {
++            if (Player* player = ObjectAccessor::FindConnectedPlayer(guid))
++                if (player->GetSession() && !player->GetSession()->IsBot())
++                    return true;
++        }
++        return false;
++    };
++
++    auto realPlayersFirst = [&containsRealPlayer](GroupQueueInfo const* left, GroupQueueInfo const* right)
++    {
++        return containsRealPlayer(left) && !containsRealPlayer(right);
++    };
++
++    m_QueuedGroups[bracket_id][BG_QUEUE_NORMAL_ALLIANCE].sort(realPlayersFirst);
++    m_QueuedGroups[bracket_id][BG_QUEUE_NORMAL_HORDE].sort(realPlayersFirst);
++
+     int32 hordeFree = bg->GetFreeSlotsForTeam(TEAM_HORDE);
+     int32 aliFree = bg->GetFreeSlotsForTeam(TEAM_ALLIANCE);
+     uint32 aliCount = m_QueuedGroups[bracket_id][BG_QUEUE_NORMAL_ALLIANCE].size();
+@@ -953,7 +1053,6 @@ void BattlegroundQueue::BattlegroundQueueUpdate(uint32 diff, BattlegroundTypeId
+         // we need to find 2 teams which will play next game
+         GroupsQueueType::iterator itr_teams[PVP_TEAMS_COUNT];
+         uint8 found = 0;
+-        uint8 team = 0;
+ 
+         for (uint8 i = BG_QUEUE_PREMADE_ALLIANCE; i < BG_QUEUE_NORMAL_ALLIANCE; i++)
+         {
+@@ -967,7 +1066,6 @@ void BattlegroundQueue::BattlegroundQueueUpdate(uint32 diff, BattlegroundTypeId
+                         || (int32)(*itr2)->JoinTime < discardTime))
+                 {
+                     itr_teams[found++] = itr2;
+-                    team = i;
+                     break;
+                 }
+             }
+@@ -976,17 +1074,46 @@ void BattlegroundQueue::BattlegroundQueueUpdate(uint32 diff, BattlegroundTypeId
+         if (!found)
+             return;
+ 
++        // The two faction queues are inspected independently above. If that
++        // produced an incompatible Solitary/real-player pair, keep the
++        // Solitary group as the anchor and search both queues for a bot-only
++        // opponent instead.
++        if (found == 2 && !QueueGroupsCanShareMatch(*(itr_teams[0]), *(itr_teams[1])))
++        {
++            if ((*(itr_teams[1]))->IsSolitary)
++                itr_teams[0] = itr_teams[1];
++            found = 1;
++        }
++
+         if (found == 1)
+         {
+-            for (GroupsQueueType::iterator itr3 = itr_teams[0]; itr3 != m_QueuedGroups[bracket_id][team].end(); ++itr3)
++            for (uint8 queueType = BG_QUEUE_PREMADE_ALLIANCE;
++                queueType < BG_QUEUE_NORMAL_ALLIANCE && found == 1; ++queueType)
+             {
+-                if (!(*itr3)->IsInvitedToBGInstanceGUID
+-                    && (((*itr3)->ArenaMatchmakerRating >= arenaMinRating && (*itr3)->ArenaMatchmakerRating <= arenaMaxRating) || (int32)(*itr3)->JoinTime < discardTime)
+-                    && ((*(itr_teams[0]))->ArenaTeamId != (*itr3)->PreviousOpponentsTeamId || ((int32)(*itr3)->JoinTime < discardOpponentsTime))
+-                    && (*(itr_teams[0]))->ArenaTeamId != (*itr3)->ArenaTeamId)
++                for (GroupsQueueType::iterator itr3 = m_QueuedGroups[bracket_id][queueType].begin();
++                    itr3 != m_QueuedGroups[bracket_id][queueType].end(); ++itr3)
+                 {
+-                    itr_teams[found++] = itr3;
+-                    break;
++                    if (*itr3 == *(itr_teams[0]))
++                        continue;
++
++                    bool const solitaryBotPair = IsSolitaryRatedBotPair(*(itr_teams[0]), *itr3);
++                    bool const ratingCompatible =
++                        ((*itr3)->ArenaMatchmakerRating >= arenaMinRating &&
++                            (*itr3)->ArenaMatchmakerRating <= arenaMaxRating) ||
++                        (int32)(*itr3)->JoinTime < discardTime;
++                    bool const previousOpponentCompatible =
++                        (*(itr_teams[0]))->ArenaTeamId != (*itr3)->PreviousOpponentsTeamId ||
++                        (int32)(*itr3)->JoinTime < discardOpponentsTime;
++
++                    if (!(*itr3)->IsInvitedToBGInstanceGUID
++                        && (ratingCompatible || solitaryBotPair)
++                        && (previousOpponentCompatible || solitaryBotPair)
++                        && (*(itr_teams[0]))->ArenaTeamId != (*itr3)->ArenaTeamId
++                        && QueueGroupsCanShareMatch(*(itr_teams[0]), *itr3))
++                    {
++                        itr_teams[found++] = itr3;
++                        break;
++                    }
+                 }
+             }
+         }
+@@ -997,6 +1124,15 @@ void BattlegroundQueue::BattlegroundQueueUpdate(uint32 diff, BattlegroundTypeId
+             GroupQueueInfo* aTeam = *(itr_teams[TEAM_ALLIANCE]);
+             GroupQueueInfo* hTeam = *(itr_teams[TEAM_HORDE]);
+ 
++            // Random bot ArenaTeams often have no persisted member MMR and
++            // therefore enter the queue with MMR 0. A Solitary player uses a
++            // persistent personal MMR, so the normal rating window would keep
++            // a complete player-vs-bots match waiting until rating discard.
++            // Normalize only the bot-only side for this one queue match. The
++            // real player's rating remains authoritative and normal rated
++            // player-vs-player matchmaking is untouched.
++            NormalizeSolitaryRatedBotMmr(aTeam, hTeam);
++
+             Battleground* arena = sBattlegroundMgr->CreateNewBattleground(bgTypeId, bracketEntry, arenaType, true);
+             if (!arena)
+             {
+@@ -1307,6 +1443,25 @@ void BattlegroundQueue::InviteGroupToBG(GroupQueueInfo* ginfo, Battleground* bg,
+     if (ginfo->IsInvitedToBGInstanceGUID)
+         return;
+ 
++    // A Solitary instance may contain exactly one socket-backed player. Bots
++    // are always compatible; ordinary real players and another Solitary are
++    // rejected defensively even if a future matcher bypasses the script hook.
++    if (ginfo->HasRealPlayer)
++    {
++        if ((ginfo->IsSolitary && (bg->IsSolitaryCohort() || bg->HasStandardPlayerCohort())) ||
++            (!ginfo->IsSolitary && bg->IsSolitaryCohort()))
++        {
++            LOG_ERROR("bg.matchmaking", "Rejected incompatible real-player queue group for battleground instance {}",
++                bg->GetInstanceID());
++            return;
++        }
++
++        if (ginfo->IsSolitary)
++            bg->RegisterSolitaryCohort();
++        else
++            bg->RegisterStandardPlayerCohort();
++    }
++
+     // set side if needed
+     if (teamId != TEAM_NEUTRAL)
+         ginfo->teamId = teamId;
+diff --git a/src/server/game/Battlegrounds/BattlegroundQueue.h b/src/server/game/Battlegrounds/BattlegroundQueue.h
+index 34575e539..4a24750f0 100644
+--- a/src/server/game/Battlegrounds/BattlegroundQueue.h
++++ b/src/server/game/Battlegrounds/BattlegroundQueue.h
+@@ -50,6 +50,9 @@ struct GroupQueueInfo                                       // stores informatio
+     uint32  PreviousOpponentsTeamId;                        // excluded from the current queue until the timer is met
+     uint8   BracketId;                                      // BattlegroundBracketId
+     uint8   GroupType;                                      // BattlegroundQueueGroupTypes
++    bool    IsSolitary;                                     // contains the solitary real player
++    bool    HasRealPlayer;                                  // contains at least one socket-backed player
++    ObjectGuid::LowType SolitaryOwnerGuid;                  // owner of this isolated bot cohort
+ };
+ 
+ enum BattlegroundQueueGroupTypes
+diff --git a/src/server/game/Combat/ThreatManager.cpp b/src/server/game/Combat/ThreatManager.cpp
+index 07e02ae0f..001568a15 100644
+--- a/src/server/game/Combat/ThreatManager.cpp
++++ b/src/server/game/Combat/ThreatManager.cpp
+@@ -32,6 +32,7 @@
+ #include "MotionMaster.h"
+ #include "ObjectAccessor.h"
+ #include "Player.h"
++#include "ScriptMgr.h"
+ #include "SpellAuraEffects.h"
+ #include "SpellInfo.h"
+ #include "SpellMgr.h"
+@@ -418,6 +419,9 @@ void ThreatManager::AddThreat(Unit* target, float amount, SpellInfo const* spell
+     if (!ignoreModifiers)
+         amount = CalculateModifiedThreat(amount, target, spell);
+ 
++    if (!ignoreModifiers)
++        sScriptMgr->ModifyThreat(target, _owner, spell, amount);
++
+     // if we're increasing threat, send some/all of it to redirection targets instead if applicable
+     if (!ignoreRedirects && amount > 0.0f)
+     {
+diff --git a/src/server/game/DungeonFinding/LFGQueue.cpp b/src/server/game/DungeonFinding/LFGQueue.cpp
+index 85f92d1f5..80c3dd061 100644
+--- a/src/server/game/DungeonFinding/LFGQueue.cpp
++++ b/src/server/game/DungeonFinding/LFGQueue.cpp
+@@ -24,10 +24,14 @@
+ #include "LFGMgr.h"
+ #include "Log.h"
+ #include "ObjectMgr.h"
++#include "ObjectAccessor.h"
+ #include "Player.h"
+ #include "ScriptMgr.h"
+ #include "World.h"
+ 
++#include <algorithm>
++#include <limits>
++
+ namespace lfg
+ {
+     LfgQueueData::LfgQueueData() :
+@@ -108,6 +112,19 @@ namespace lfg
+     {
+         LOG_DEBUG("lfg", "JOINED AddQueueData: {}", guid.ToString());
+         QueueDataStore[guid] = LfgQueueData(joinTime, dungeons, rolesMap);
++        LfgQueueData& queueData = QueueDataStore[guid];
++        for (auto const& [playerGuid, role] : rolesMap)
++        {
++            (void)role;
++            if (Player* player = ObjectAccessor::FindConnectedPlayer(playerGuid))
++            {
++                queueData.isSolitary = queueData.isSolitary || player->IsSolitary() || player->IsSolitaryActivityBot();
++                bool const isRealPlayer = player->GetSession() && !player->GetSession()->GetRemoteAddress().empty();
++                queueData.hasRealPlayer = queueData.hasRealPlayer || isRealPlayer;
++                if (isRealPlayer && queueData.realPlayerCount < std::numeric_limits<uint8>::max())
++                    ++queueData.realPlayerCount;
++            }
++        }
+         AddToQueue(guid);
+     }
+ 
+@@ -263,6 +280,9 @@ namespace lfg
+         // Check if more than one LFG group and number of players joining
+         uint8 numPlayers = 0;
+         uint8 numLfgGroups = 0;
++        bool hasSolitaryCohort = false;
++        bool hasStandardRealPlayer = false;
++        uint8 solitaryRealPlayerCount = 0;
+         ObjectGuid guid;
+         uint64 addToFoundMask = 0;
+ 
+@@ -276,6 +296,15 @@ namespace lfg
+                 return LFG_COMPATIBILITY_PENDING;
+             }
+ 
++            hasSolitaryCohort = hasSolitaryCohort || itQueue->second.isSolitary;
++            hasStandardRealPlayer = hasStandardRealPlayer ||
++                (itQueue->second.hasRealPlayer && !itQueue->second.isSolitary);
++            if (itQueue->second.isSolitary)
++                solitaryRealPlayerCount = uint8(std::min<uint16>(uint16(solitaryRealPlayerCount) +
++                    itQueue->second.realPlayerCount, std::numeric_limits<uint8>::max()));
++            if (hasSolitaryCohort && (hasStandardRealPlayer || solitaryRealPlayerCount > 1))
++                return LFG_INCOMPATIBLES_SOLITARY_COHORT;
++
+             // Store group so we don't need to call Mgr to get it later (if it's player group will be 0 otherwise would have joined as group)
+             for (LfgRolesMap::const_iterator it2 = itQueue->second.roles.begin(); it2 != itQueue->second.roles.end(); ++it2)
+                 proposalGroups[it2->first] = itQueue->first.IsGroup() ? itQueue->first : ObjectGuid::Empty;
+diff --git a/src/server/game/DungeonFinding/LFGQueue.h b/src/server/game/DungeonFinding/LFGQueue.h
+index 7c6183582..ddf7ea368 100644
+--- a/src/server/game/DungeonFinding/LFGQueue.h
++++ b/src/server/game/DungeonFinding/LFGQueue.h
+@@ -31,6 +31,7 @@ namespace lfg
+         LFG_INCOMPATIBLES_HAS_IGNORES,
+         LFG_INCOMPATIBLES_NO_ROLES,
+         LFG_INCOMPATIBLES_NO_DUNGEONS,
++        LFG_INCOMPATIBLES_SOLITARY_COHORT,
+         LFG_COMPATIBLES_WITH_LESS_PLAYERS,                     // Values under this = not compatible (do not modify order)
+         LFG_COMPATIBLES_MATCH                                  // Must be the last one
+     };
+@@ -52,6 +53,9 @@ namespace lfg
+         uint8 dps{LFG_DPS_NEEDED};                             // Dps needed
+         LfgDungeonSet dungeons;                                // Selected Player/Group Dungeon/s
+         LfgRolesMap roles;                                     // Selected Player Role/s
++        bool isSolitary{false};                                // bound to the Одиночка-only cohort
++        bool hasRealPlayer{false};                             // contains a socket-backed client
++        uint8 realPlayerCount{0};                              // defensive exact count for one-real-player cohorts
+         Lfg5Guids bestCompatible;                              // Best compatible combination of people queued
+     };
+ 
+diff --git a/src/server/game/Entities/Player/Player.cpp b/src/server/game/Entities/Player/Player.cpp
+index c5732626f..5cd7b44e7 100644
+--- a/src/server/game/Entities/Player/Player.cpp
++++ b/src/server/game/Entities/Player/Player.cpp
+@@ -16,6 +16,7 @@
+  */
+ 
+ #include "Player.h"
++#include "HardcoreMemorialHooks.h"
+ #include "AccountMgr.h"
+ #include "AchievementMgr.h"
+ #include "AreaDefines.h"
+@@ -850,6 +851,7 @@ uint32 Player::EnvironmentalDamage(EnviromentalDamage type, uint32 damage)
+     packet.Resisted = resist;
+     SendMessageToSet(packet.Write(), true);
+ 
++    HardcoreEnvironmentScope hardcoreEnvironment(this, uint8(type));
+     uint32 final_damage = Unit::DealDamage(this, this, damage, nullptr, SELF_DAMAGE, SPELL_SCHOOL_MASK_NORMAL, nullptr, false);
+ 
+     if (!IsAlive())
+@@ -1076,6 +1078,12 @@ void Player::UpdateInvisibilityDrunkDetect()
+ 
+ void Player::setDeathState(DeathState s, bool /*despawn = false*/)
+ {
++    // Also protect direct script/GM state changes which bypass ResurrectPlayer.
++    if (s == DeathState::Alive && IsHardcoreFallen() && !IsAlive())
++        return;
++    if (s == DeathState::JustDied && IsAlive() && GetHardcoreState() == 1)
++        RecordHardcoreDeath();
++
+     uint32 ressSpellId = 0;
+ 
+     bool cur = IsAlive();
+@@ -2063,7 +2071,8 @@ void Player::RegenerateHealth()
+ 
+     // always regeneration bonus (including combat)
+     addvalue += GetTotalAuraModifier(SPELL_AURA_MOD_HEALTH_REGEN_IN_COMBAT);
+-    addvalue += m_baseHealthRegen / 2.5f;
++    if (!HasHardcorePact(11))
++        addvalue += m_baseHealthRegen / 2.5f;
+ 
+     if (addvalue < 0)
+         addvalue = 0;
+@@ -4543,7 +4552,7 @@ void Player::BuildPlayerRepop()
+ 
+ void Player::ResurrectPlayer(float restore_percent, bool applySickness)
+ {
+-    if (!sScriptMgr->OnPlayerCanResurrect(this))
++    if (IsHardcoreFallen() || !sScriptMgr->OnPlayerCanResurrect(this))
+         return;
+ 
+     WorldPacket data(SMSG_DEATH_RELEASE_LOC, 4 * 4);        // remove spirit healer position
+@@ -7402,7 +7411,7 @@ void Player::ApplyEquipSpell(SpellInfo const* spellInfo, Item* item, bool apply,
+     }
+ }
+ 
+-void Player::CastItemCombatSpell(Unit* target, WeaponAttackType attType, uint32 procVictim, uint32 procEx)
++void Player::CastItemCombatSpell(Unit* target, WeaponAttackType attType, uint32 procVictim, uint32 procEx, uint32 enchantDispelMask)
+ {
+     if (!target || !target->IsAlive() || target == this)
+         return;
+@@ -7419,6 +7428,10 @@ void Player::CastItemCombatSpell(Unit* target, WeaponAttackType attType, uint32
+             if (!item->IsBroken())
+                 if (ItemTemplate const* proto = item->GetTemplate())
+                 {
++                    // Optional weapon-enchantment-only mode for extra strikes.
++                    // Zero preserves the original all-item proc behaviour.
++                    if (enchantDispelMask && proto->Class != ITEM_CLASS_WEAPON)
++                        continue;
+                     // Additional check for weapons
+                     if (proto->Class == ITEM_CLASS_WEAPON)
+                     {
+@@ -7443,18 +7456,18 @@ void Player::CastItemCombatSpell(Unit* target, WeaponAttackType attType, uint32
+                             continue;
+                     }
+ 
+-                    CastItemCombatSpell(target, attType, procVictim, procEx, item, proto);
++                    CastItemCombatSpell(target, attType, procVictim, procEx, item, proto, enchantDispelMask);
+                 }
+     }
+ }
+ 
+-void Player::CastItemCombatSpell(Unit* target, WeaponAttackType attType, uint32 procVictim, uint32 procEx, Item* item, ItemTemplate const* proto)
++void Player::CastItemCombatSpell(Unit* target, WeaponAttackType attType, uint32 procVictim, uint32 procEx, Item* item, ItemTemplate const* proto, uint32 enchantDispelMask)
+ {
+     if (!sScriptMgr->OnPlayerCanCastItemCombatSpell(this, target, attType, procVictim, procEx, item, proto))
+         return;
+ 
+     // Can do effect if any damage done to target
+-    if (procVictim & PROC_FLAG_TAKEN_DAMAGE)
++    if (!enchantDispelMask && (procVictim & PROC_FLAG_TAKEN_DAMAGE))
+         //if (damageInfo->procVictim & PROC_FLAG_TAKEN_ANY_DAMAGE)
+     {
+         for (uint8 i = 0; i < MAX_ITEM_SPELLS; ++i)
+@@ -7533,6 +7546,9 @@ void Player::CastItemCombatSpell(Unit* target, WeaponAttackType attType, uint32
+                 continue;
+             }
+ 
++            if (enchantDispelMask && !(enchantDispelMask & (1u << spellInfo->Dispel)))
++                continue;
++
+             if (entry && (entry->attributeMask & ENCHANT_PROC_ATTR_EXCLUSIVE) != 0)
+             {
+                 Unit* checkTarget = spellInfo->IsPositive() ? this : target;
+@@ -7554,6 +7570,7 @@ void Player::CastItemCombatSpell(Unit* target, WeaponAttackType attType, uint32
+ 
+             // Apply spell mods
+             ApplySpellMod(pEnchant->spellid[s], SPELLMOD_CHANCE_OF_SUCCESS, chance);
++            sScriptMgr->ModifyItemCombatSpellChance(this, target, spellInfo, chance);
+ 
+             // Shiv has 100% chance to apply the poison
+             if (FindCurrentSpellBySpellId(5938) && e_slot == TEMP_ENCHANTMENT_SLOT)
+@@ -8444,7 +8461,14 @@ void Player::SendInitWorldStates(uint32 zoneId, uint32 areaId)
+         packet.Worldstates.emplace_back(WORLD_STATE_OPVP_NA_UI_GUARDS_LEFT, 15);
+     }
+ 
+-    if (Player::bgZoneIdToFillWorldStates.find(zoneId) != Player::bgZoneIdToFillWorldStates.end())
++    // Some backported battleground collision/map data cannot resolve the retail
++    // AreaTable zone and reports zone 0.  The battleground instance still owns
++    // the authoritative initial world states, so do not suppress its UI.
++    if (zoneId == 0 && battleground)
++    {
++        battleground->FillInitialWorldStates(packet);
++    }
++    else if (Player::bgZoneIdToFillWorldStates.find(zoneId) != Player::bgZoneIdToFillWorldStates.end())
+     {
+         Player::bgZoneIdToFillWorldStates[zoneId](battleground, packet);
+     }
+@@ -11161,6 +11185,12 @@ void Player::AddSpellAndCategoryCooldowns(SpellInfo const* spellInfo, uint32 ite
+             }
+         }
+ 
++        int32 const recoveryBeforeScript = rec;
++        int32 const categoryRecoveryBeforeScript = catrec;
++        sScriptMgr->ModifyCooldown(this, spellInfo, rec, catrec);
++        if (rec != recoveryBeforeScript || catrec != categoryRecoveryBeforeScript)
++            needsCooldownPacket = true;
++
+         // replace negative cooldowns by 0
+         if (rec < 0) rec = 0;
+         if (catrec < 0) catrec = 0;
+@@ -13878,7 +13908,8 @@ LootItem* Player::StoreLootItem(uint8 lootSlot, Loot* loot, InventoryResult& msg
+     }
+ 
+     ItemPosCountVec dest;
+-    msg = CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, item->itemid, item->count);
++    uint32 awardedCount = qitem ? item->count : HardcoreGatherCount(item->itemid, item->count, loot);
++    msg = CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, item->itemid, awardedCount);
+     if (msg == EQUIP_ERR_OK)
+     {
+         AllowedLooterSet looters = item->GetAllowedLooters();
+@@ -13916,7 +13947,7 @@ LootItem* Player::StoreLootItem(uint8 lootSlot, Loot* loot, InventoryResult& msg
+ 
+         --loot->unlootedCount;
+ 
+-        SendNewItem(newitem, uint32(item->count), false, false, true);
++        SendNewItem(newitem, awardedCount, false, false, true);
+         UpdateLootAchievements(item, loot);
+ 
+         // LootItem is being removed (looted) from the container, delete it from the DB.
+@@ -14192,11 +14223,14 @@ void Player::HandleFall(MovementInfo const& movementInfo)
+         int32 safe_fall = GetTotalAuraModifier(SPELL_AURA_SAFE_FALL);
+ 
+         float damageperc = FALL_DMG_EQU_SLOPE * (z_diff - safe_fall) + FALL_DMG_EQU_INTERCEPT;
++        float rawDamagePct = std::max(0.0f, FALL_DMG_EQU_SLOPE * z_diff + FALL_DMG_EQU_INTERCEPT);
++        uint32 rawDamage = uint32(std::min(float(GetMaxHealth()),
++            rawDamagePct * GetMaxHealth() * sWorld->getRate(RATE_DAMAGE_FALL)));
+         uint32 original_health = GetHealth(), final_damage = 0;
+ 
+-        if (damageperc > 0 && !IsImmunedToDamageOrSchool(SPELL_SCHOOL_MASK_NORMAL))
++        if ((damageperc > 0 || rawDamage > 0) && !IsImmunedToDamageOrSchool(SPELL_SCHOOL_MASK_NORMAL))
+         {
+-            uint32 damage = (uint32)(damageperc * GetMaxHealth() * sWorld->getRate(RATE_DAMAGE_FALL));
++            uint32 damage = uint32(std::max(0.0f, damageperc) * GetMaxHealth() * sWorld->getRate(RATE_DAMAGE_FALL));
+ 
+             if (damage > 0)
+             {
+@@ -14210,8 +14244,11 @@ void Player::HandleFall(MovementInfo const& movementInfo)
+                 if (HasAura(SPELL_DIVINE_PROTECTION))
+                     damage /= 2;
+ 
+-                final_damage = EnvironmentalDamage(DAMAGE_FALL, damage);
+             }
++            sScriptMgr->BeforeFallDamage(this, rawDamage, damage);
++            if (damage)
++                final_damage = EnvironmentalDamage(DAMAGE_FALL, damage);
++            sScriptMgr->AfterFallDamage(this, rawDamage, final_damage);
+ 
+             //Z given by moveinfo, LastZ, FallTime, WaterZ, MapZ, Damage, Safefall reduction
+             LOG_DEBUG("entities.player", "FALLDAMAGE mZ={} z={} fallTime={} damage={} SF={}", movementInfo.pos.GetPositionZ(), GetPositionZ(), movementInfo.fallTime, damage, safe_fall);
+diff --git a/src/server/game/Entities/Player/Player.h b/src/server/game/Entities/Player/Player.h
+index cd1747d44..b84864c7c 100644
+--- a/src/server/game/Entities/Player/Player.h
++++ b/src/server/game/Entities/Player/Player.h
+@@ -1089,9 +1089,40 @@ class Player : public Unit, public GridObject<Player>
+     friend void Item::AddToUpdateQueueOf(Player* player);
+     friend void Item::RemoveFromUpdateQueueOf(Player* player);
+ public:
++    // Hardcore attempt state is durable; it must not depend on an aura or UI.
++    [[nodiscard]] uint8 GetHardcoreState() const { return m_hardcoreState; }
++    [[nodiscard]] bool IsHardcore() const { return m_hardcoreState == 1 || m_hardcoreState == 2; }
++    [[nodiscard]] bool IsHardcoreFallen() const { return m_hardcoreState == 2; }
++    [[nodiscard]] uint16 GetHardcorePacts() const { return m_hardcorePacts; }
++    [[nodiscard]] bool HasHardcorePact(uint8 pact) const
++    {
++        return IsHardcore() && pact >= 1 && pact <= 12 && (m_hardcorePacts & (1u << (pact - 1)));
++    }
++    static bool ValidateHardcorePacts(uint16 mask, uint8 playerClass);
++    static bool IsHardcoreCharacter(ObjectGuid guid);
++    [[nodiscard]] uint32 HardcoreGatherCount(uint32 itemId, uint32 count, Loot const* loot) const;
++    void AppendHardcoreCreation(CharacterDatabaseTransaction transaction, uint16 pacts = 0);
++    bool LoadHardcoreState();
++    void RecordHardcoreDeath();
++    bool LeaveHardcore();
++    static void InitializeHardcoreJournal();
++
++    static constexpr uint32 SPELL_ID_SOLITARY = 80919;
++
+     explicit Player(WorldSession* session);
+     ~Player() override;
+ 
++    [[nodiscard]] bool IsSolitary() const { return HasAura(SPELL_ID_SOLITARY); }
++    [[nodiscard]] bool IsSolitaryActivityBot() const { return m_isSolitaryActivityBot; }
++    [[nodiscard]] ObjectGuid::LowType GetSolitaryActivityOwnerGuid() const { return m_solitaryActivityOwnerGuid; }
++    void SetSolitaryActivityBot(bool value)
++    {
++        m_isSolitaryActivityBot = value;
++        if (!value)
++            m_solitaryActivityOwnerGuid = 0;
++    }
++    void SetSolitaryActivityOwnerGuid(ObjectGuid::LowType value) { m_solitaryActivityOwnerGuid = value; }
++
+     void CleanupsBeforeDelete(bool finalCleanup = true) override;
+ 
+     void AddToWorld() override;
+@@ -1998,6 +2029,9 @@ public:
+     float OCTRegenMPPerSpirit();
+     [[nodiscard]] float GetRatingMultiplier(CombatRating cr) const;
+     [[nodiscard]] float GetRatingBonusValue(CombatRating cr) const;
++    [[nodiscard]] uint32 GetVersatilityRating() const;
++    [[nodiscard]] float GetVersatilityDamageAndHealingPct() const;
++    [[nodiscard]] float GetVersatilityDamageReductionPct() const;
+     uint32 GetBaseSpellPowerBonus() { return m_baseSpellPower; }
+     uint32 GetBaseSpellDamageBonus() { return m_baseSpellDamage; }
+     uint32 GetBaseSpellHealingBonus() { return m_baseSpellHealing; }
+@@ -2270,9 +2304,9 @@ public:
+     void ApplyItemEquipSpell(Item* item, bool apply, bool form_change = false);
+     void ApplyEquipSpell(SpellInfo const* spellInfo, Item* item, bool apply, bool form_change = false);
+     void UpdateEquipSpellsAtFormChange();
+-    void CastItemCombatSpell(Unit* target, WeaponAttackType attType, uint32 procVictim, uint32 procEx);
++    void CastItemCombatSpell(Unit* target, WeaponAttackType attType, uint32 procVictim, uint32 procEx, uint32 enchantDispelMask = 0);
+     void CastItemUseSpell(Item* item, SpellCastTargets const& targets, uint8 cast_count, uint32 glyphIndex);
+-    void CastItemCombatSpell(Unit* target, WeaponAttackType attType, uint32 procVictim, uint32 procEx, Item* item, ItemTemplate const* proto);
++    void CastItemCombatSpell(Unit* target, WeaponAttackType attType, uint32 procVictim, uint32 procEx, Item* item, ItemTemplate const* proto, uint32 enchantDispelMask = 0);
+ 
+     void SendEquipmentSetList();
+     void SetEquipmentSet(uint32 index, EquipmentSet eqset);
+@@ -3084,6 +3118,10 @@ private:
+     bool _expectingChangeTransport;
+     uint32 _pendingFlightChangeCounter;
+     uint32 _mapChangeOrderCounter;
++    uint16 m_hardcorePacts = 0;
++    uint8 m_hardcoreState = 0;
++    bool m_isSolitaryActivityBot = false;
++    ObjectGuid::LowType m_solitaryActivityOwnerGuid = 0;
+ };
+ 
+ void AddItemsSetItem(Player* player, Item* item);
+diff --git a/src/server/game/Entities/Player/PlayerQuest.cpp b/src/server/game/Entities/Player/PlayerQuest.cpp
+index 7361ac62d..c3af20c05 100644
+--- a/src/server/game/Entities/Player/PlayerQuest.cpp
++++ b/src/server/game/Entities/Player/PlayerQuest.cpp
+@@ -789,6 +789,9 @@ void Player::RewardQuest(Quest const* quest, uint32 reward, Object* questGiver,
+             moneyRew /= 2;
+     }
+ 
++    if (moneyRew > 0 && HasHardcorePact(5))
++        moneyRew += moneyRew / 2;
++
+     if (moneyRew)
+     {
+         ModifyMoney(moneyRew);
+@@ -2399,6 +2402,10 @@ bool Player::HasQuestForItem(uint32 itemid, uint32 excludeQuestId /* 0 */, bool
+             }
+         }
+     }
++
++    if (!turnIn && excludeQuestId == 0 && sScriptMgr->OnPlayerHasQuestForItem(this, itemid, showInLoot))
++        return true;
++
+     return false;
+ }
+ 
+diff --git a/src/server/game/Entities/Player/PlayerStorage.cpp b/src/server/game/Entities/Player/PlayerStorage.cpp
+index 8b604b40e..993d618ca 100644
+--- a/src/server/game/Entities/Player/PlayerStorage.cpp
++++ b/src/server/game/Entities/Player/PlayerStorage.cpp
+@@ -5084,6 +5084,10 @@ bool Player::LoadFromDB(ObjectGuid playerGuid, CharacterDatabaseQueryHolder cons
+     bytes0 |= Gender << 16;                                 // gender
+     SetUInt32Value(UNIT_FIELD_BYTES_0, bytes0);
+ 
++    // Pact eligibility needs the durable class before any derived auras are loaded.
++    if (!LoadHardcoreState())
++        return false;
++
+     m_realRace = fields[3].Get<uint8>(); // set real race
+     m_race = fields[3].Get<uint8>(); // set real race
+ 
+@@ -5801,8 +5805,16 @@ void Player::_LoadActions(PreparedQueryResult result)
+             uint32 action = fields[1].Get<uint32>();
+             uint8 type = fields[2].Get<uint8>();
+ 
++            uint32 const originalAction = action;
++            uint8 const originalType = type;
++            if (!sScriptMgr->OnPlayerBeforeLoadActionButton(this, button, action, type))
++            {
++                m_actionButtons[button].uState = ACTIONBUTTON_DELETED;
++                continue;
++            }
++
+             if (ActionButton* ab = addActionButton(button, action, type))
+-                ab->uState = ACTIONBUTTON_UNCHANGED;
++                ab->uState = (action == originalAction && type == originalType) ? ACTIONBUTTON_UNCHANGED : ACTIONBUTTON_CHANGED;
+             else
+             {
+ 
+@@ -7122,7 +7134,7 @@ bool Player::CheckInstanceLoginValid()
+     if (GetMap()->IsRaid())
+     {
+         // cannot be in raid instance without a group
+-        if (!GetGroup() && !sWorld->getBoolConfig(CONFIG_INSTANCE_IGNORE_RAID))
++        if (!GetGroup() && !IsSolitary() && !sWorld->getBoolConfig(CONFIG_INSTANCE_IGNORE_RAID))
+             return false;
+     }
+     else
+@@ -7366,7 +7378,9 @@ void Player::_SaveAuras(CharacterDatabaseTransaction trans, bool logout)
+             continue;
+ 
+         Aura* aura = itr->second;
+-        if (!logout && aura->GetDuration() < 60 * IN_MILLISECONDS )
++        // Infinite auras use duration -1. They must be persisted during an
++        // explicit non-logout save; only short, finite auras are skipped.
++        if (!logout && aura->GetDuration() > 0 && aura->GetDuration() < 60 * IN_MILLISECONDS)
+             continue;
+ 
+         int32 damage[MAX_SPELL_EFFECTS];
+diff --git a/src/server/game/Entities/Unit/StatSystem.cpp b/src/server/game/Entities/Unit/StatSystem.cpp
+index 24c025ac6..2828aa3dd 100644
+--- a/src/server/game/Entities/Unit/StatSystem.cpp
++++ b/src/server/game/Entities/Unit/StatSystem.cpp
+@@ -864,10 +864,31 @@ void Player::UpdateSpellCritChance(uint32 school)
+ 
+ void Player::UpdateArmorPenetration(int32 amount)
+ {
+-    // Store Rating Value
++    // The 3.3.5 client has no dedicated Versatility combat-rating slot. Keep
++    // using the former Armor Penetration slot on the wire and reinterpret it
++    // as Versatility in all server-side combat calculations.
+     SetUInt32Value(PLAYER_FIELD_COMBAT_RATING_1 + static_cast<uint16>(CR_ARMOR_PENETRATION), amount);
+ }
+ 
++uint32 Player::GetVersatilityRating() const
++{
++    return GetUInt32Value(PLAYER_FIELD_COMBAT_RATING_1 + static_cast<uint16>(CR_ARMOR_PENETRATION));
++}
++
++float Player::GetVersatilityDamageAndHealingPct() const
++{
++    constexpr float RatingPerPct = 40.0f;
++    return GetVersatilityRating() / RatingPerPct + GetTotalAuraModifier(SPELL_AURA_MOD_ARMOR_PENETRATION_PCT);
++}
++
++float Player::GetVersatilityDamageReductionPct() const
++{
++    constexpr float DamageReductionRatio = 0.5f;
++    constexpr float MaximumDamageReductionPct = 75.0f;
++    return std::clamp(GetVersatilityDamageAndHealingPct() * DamageReductionRatio, 0.0f,
++        MaximumDamageReductionPct);
++}
++
+ void Player::UpdateMeleeHitChances()
+ {
+     m_modMeleeHitChance = (float)GetTotalAuraModifier(SPELL_AURA_MOD_HIT_CHANCE);
+diff --git a/src/server/game/Entities/Unit/Unit.cpp b/src/server/game/Entities/Unit/Unit.cpp
+index 47d331ad5..33d41785e 100644
+--- a/src/server/game/Entities/Unit/Unit.cpp
++++ b/src/server/game/Entities/Unit/Unit.cpp
+@@ -54,6 +54,7 @@
+ #include "PetAI.h"
+ #include "PetPackets.h"
+ #include "Player.h"
++#include "HardcoreMemorialHooks.h"
+ #include "ReputationMgr.h"
+ #include "ScriptMgr.h"
+ #include "SharedDefines.h"
+@@ -291,6 +292,41 @@ uint32 DamageInfo::GetUnmitigatedDamage() const
+     return m_damage + m_cleanDamage + m_absorb + m_resist;
+ }
+ 
++namespace
++{
++uint32 RemoveAppliedSolitaryOutgoingMultiplier(DamageInfo const& damageInfo, uint32 damage)
++{
++    if (!damage)
++        return 0;
++
++    Unit* victim = damageInfo.GetVictim();
++    Map* map = victim ? victim->GetMap() : nullptr;
++    if (!map || !map->IsDungeon() || map->IsBattlegroundOrArena())
++        return damage;
++
++    Unit* attacker = damageInfo.GetAttacker();
++    Player* sourcePlayer = attacker ? attacker->GetCharmerOrOwnerPlayerOrPlayerItself() : nullptr;
++    Player* targetPlayer = victim->GetCharmerOrOwnerPlayerOrPlayerItself();
++    if (!sourcePlayer || !sourcePlayer->IsSolitary() || targetPlayer)
++        return damage;
++
++    // A derived damaging spell will pass through the regular Solitary x10 hook
++    // itself. Remove the x10 already present in its parent hit so it is not
++    // applied twice. Round to the nearest integer and preserve positive damage.
++    return static_cast<uint32>(std::max<uint64>(1, (uint64(damage) + 5) / 10));
++}
++}
++
++uint32 DamageInfo::GetDamageForDerivedEffect() const
++{
++    return RemoveAppliedSolitaryOutgoingMultiplier(*this, GetDamage());
++}
++
++uint32 DamageInfo::GetUnmitigatedDamageForDerivedEffect() const
++{
++    return RemoveAppliedSolitaryOutgoingMultiplier(*this, GetUnmitigatedDamage());
++}
++
+ ProcEventInfo::ProcEventInfo(Unit* actor, Unit* actionTarget, Unit* procTarget, uint32 typeMask, uint32 spellTypeMask, uint32 spellPhaseMask, uint32 hitMask, Spell const* spell, DamageInfo* damageInfo, HealInfo* healInfo, SpellInfo const* triggeredByAuraSpell, int8 procAuraEffectIndex)
+     : _actor(actor), _actionTarget(actionTarget), _procTarget(procTarget), _typeMask(typeMask), _spellTypeMask(spellTypeMask), _spellPhaseMask(spellPhaseMask),
+       _hitMask(hitMask), _spell(spell), _damageInfo(damageInfo), _healInfo(healInfo), _triggeredByAuraSpell(triggeredByAuraSpell), _procAuraEffectIndex(procAuraEffectIndex)
+@@ -981,7 +1017,14 @@ void Unit::DealDamageMods(Unit const* victim, uint32& damage, uint32* absorb)
+ 
+ uint32 Unit::DealDamage(Unit* attacker, Unit* victim, uint32 damage, CleanDamage const* cleanDamage, DamageEffectType damagetype, SpellSchoolMask damageSchoolMask, SpellInfo const* spellProto, bool durabilityLoss, bool /*allowGM*/, Spell const* damageSpell /*= nullptr*/)
+ {
++    Player const* sourcePlayer = attacker ? attacker->GetAffectingPlayer() : nullptr;
++    Player const* targetPlayer = victim->GetAffectingPlayer();
++    if (sourcePlayer && targetPlayer && sourcePlayer != targetPlayer &&
++        (sourcePlayer->IsHardcore() || targetPlayer->IsHardcore()))
++        return 0;
++    uint32 const healthBefore = victim->GetHealth();
+     damage = sScriptMgr->DealDamage(attacker, victim, damage, damagetype);
++    sScriptMgr->ModifyDamage(attacker, victim, spellProto, damagetype, damage);
+     // Xinef: initialize damage done for rage calculations
+     // Xinef: its rare to modify damage in hooks, however training dummy's sets damage to 0
+     uint32 rage_damage = damage + ((cleanDamage != nullptr) ? cleanDamage->absorbed_damage : 0);
+@@ -1029,10 +1072,10 @@ uint32 Unit::DealDamage(Unit* attacker, Unit* victim, uint32 damage, CleanDamage
+                 attacker->DealDamageShieldDamage(victim);
+ 
+             if (!spellProto->HasAttribute(SPELL_ATTR4_DAMAGE_DOESNT_BREAK_AURAS))
+-                victim->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_TAKE_DAMAGE, spellProto->Id);
++                victim->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_TAKE_DAMAGE, spellProto->Id, false, damagetype, attacker, spellProto);
+         }
+         else
+-            victim->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_TAKE_DAMAGE, 0);
++            victim->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_TAKE_DAMAGE, 0, false, damagetype, attacker, nullptr);
+ 
+         // interrupt spells with SPELL_INTERRUPT_FLAG_ABORT_ON_DMG on absorbed damage (no dots)
+         if (!damage && damagetype != DOT && cleanDamage && cleanDamage->absorbed_damage)
+@@ -1249,7 +1292,8 @@ uint32 Unit::DealDamage(Unit* attacker, Unit* victim, uint32 damage, CleanDamage
+         victim->ModifyHealth(- (int32)damage);
+ 
+         if (damagetype == DIRECT_DAMAGE || damagetype == SPELL_DIRECT_DAMAGE)
+-            victim->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_DIRECT_DAMAGE, spellProto ? spellProto->Id : 0);
++            victim->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_DIRECT_DAMAGE, spellProto ? spellProto->Id : 0,
++                false, damagetype, attacker, spellProto);
+ 
+         if (!victim->IsPlayer())
+         {
+@@ -1343,6 +1387,19 @@ uint32 Unit::DealDamage(Unit* attacker, Unit* victim, uint32 damage, CleanDamage
+         }
+     }
+ 
++    if (damage && attacker && attacker != victim && attacker->IsPlayer() && attacker->IsAlive() &&
++        attacker->ToPlayer()->HasHardcorePact(11) && victim->IsCreature() && !targetPlayer &&
++        (damagetype == DIRECT_DAMAGE || damagetype == SPELL_DIRECT_DAMAGE) &&
++        attacker->IsHostileTo(victim) && victim->ToCreature()->GetScriptName().find("training_dummy") == std::string::npos &&
++        (!spellProto || !spellProto->HasAura(SPELL_AURA_DAMAGE_SHIELD)))
++    {
++        SpellInfo const* pact = sSpellMgr->GetSpellInfo(85020);
++        uint32 healing = CalculatePct(std::min(damage, healthBefore), 3);
++        healing = attacker->SpellHealingBonusTaken(attacker, pact, healing, HEAL);
++        HealInfo healInfo(attacker, attacker, healing, pact, pact->GetSchoolMask());
++        attacker->HealBySpell(healInfo);
++    }
++
+     LOG_DEBUG("entities.unit", "DealDamageEnd returned {} damage", damage);
+ 
+     return damage;
+@@ -2234,40 +2291,8 @@ uint32 Unit::CalcArmorReducedDamage(Unit const* attacker, Unit const* victim, co
+             if (aurEff->GetMiscValue() & SPELL_SCHOOL_MASK_NORMAL && aurEff->IsAffectedOnSpell(spellInfo))
+                 armor = std::floor(AddPct(armor, -aurEff->GetAmount()));
+ 
+-        // Apply Player CR_ARMOR_PENETRATION rating and buffs from stances\specializations etc.
+-        if (attacker->IsPlayer())
+-        {
+-            float bonusPct = 0;
+-            bonusPct += attacker->GetTotalAuraModifier(SPELL_AURA_MOD_ARMOR_PENETRATION_PCT, [spellInfo,attacker](AuraEffect const* aurEff)
+-            {
+-                if (aurEff->GetSpellInfo()->EquippedItemClass == -1)
+-                {
+-                    if (!spellInfo || aurEff->IsAffectedOnSpell(spellInfo) || aurEff->GetMiscValue() & spellInfo->GetSchoolMask())
+-                        return true;
+-                    else if (!aurEff->GetMiscValue() && !aurEff->HasSpellClassMask())
+-                        return true;
+-                }
+-                else
+-                {
+-                    if (attacker->ToPlayer()->HasItemFitToSpellRequirements(aurEff->GetSpellInfo()))
+-                        return true;
+-                }
+-                return false;
+-            });
+-
+-            float maxArmorPen = 0;
+-            if (victim->GetLevel() < 60)
+-                maxArmorPen = float(400 + 85 * victim->GetLevel());
+-            else
+-                maxArmorPen = 400 + 85 * victim->GetLevel() + 4.5f * 85 * (victim->GetLevel() - 59);
+-
+-            // Cap armor penetration to this number
+-            maxArmorPen = std::min((armor + maxArmorPen) / 3, armor);
+-            // Figure out how much armor do we ignore
+-            float armorPen = CalculatePct(maxArmorPen, bonusPct + attacker->ToPlayer()->GetRatingBonusValue(CR_ARMOR_PENETRATION));
+-            // Got the value, apply it
+-            armor -= std::min(armorPen, maxArmorPen);
+-        }
++        // CR_ARMOR_PENETRATION is repurposed as Versatility and no longer
++        // ignores armor. Ability-specific armor ignores above remain intact.
+     }
+ 
+     if (armor < 0.0f)
+@@ -5441,7 +5466,8 @@ void Unit::RemoveNotOwnSingleTargetAuras()
+     }
+ }
+ 
+-void Unit::RemoveAurasWithInterruptFlags(uint32 flag, uint32 except, bool isAutoshot /*= false*/)
++void Unit::RemoveAurasWithInterruptFlags(uint32 flag, uint32 except, bool isAutoshot /*= false*/,
++    DamageEffectType damageType /*= NODAMAGE*/, Unit* attacker /*= nullptr*/, SpellInfo const* damageSpell /*= nullptr*/)
+ {
+     if (!(m_interruptMask & flag))
+         return;
+@@ -5451,9 +5477,12 @@ void Unit::RemoveAurasWithInterruptFlags(uint32 flag, uint32 except, bool isAuto
+     {
+         Aura* aura = (*iter)->GetBase();
+         ++iter;
+-        if ((aura->GetSpellInfo()->AuraInterruptFlags & flag) && (!except || aura->GetId() != except))
++        if ((aura->GetSpellInfo()->AuraInterruptFlags & flag) && (!except || aura->GetId() != except) &&
++            sScriptMgr->CanRemoveAuraOnDamage(this, aura, attacker, damageSpell, damageType))
+         {
+             uint32 removedAuras = m_removedAurasCount;
++            if (damageType != NODAMAGE && (flag & (AURA_INTERRUPT_FLAG_TAKE_DAMAGE | AURA_INTERRUPT_FLAG_DIRECT_DAMAGE)))
++                sScriptMgr->OnAuraDamageBreak(this, aura, attacker, damageSpell, damageType);
+             RemoveAura(aura);
+             if (m_removedAurasCount > removedAuras + 1)
+                 iter = m_interruptableAuras.begin();
+@@ -5907,7 +5936,7 @@ void Unit::GetDispellableAuraList(Unit* caster, uint32 dispelMask, DispelCharges
+         Aura* aura = itr->second->GetBase();
+ 
+         // don't try to remove passive auras
+-        if (aura->IsPassive())
++        if (aura->IsPassive() || !sScriptMgr->CanDispelAura(this, aura, caster, dispelSpell))
+             continue;
+ 
+         if (aura->GetSpellInfo()->GetDispelMask() & dispelMask)
+@@ -8408,6 +8437,8 @@ void Unit::SendEnergizeSpellLog(Unit* victim, uint32 spellID, uint32 damage, Pow
+ 
+ void Unit::EnergizeBySpell(Unit* victim, uint32 spellID, uint32 damage, Powers powerType)
+ {
++    if (powerType == POWER_RAGE && victim->IsPlayer() && victim->ToPlayer()->HasHardcorePact(3))
++        damage += damage / 4;
+     victim->ModifyPower(powerType, damage, false);
+ 
+     // Happiness is internal hunter pet state, not combat assistance — energizing it must not generate threat
+@@ -8775,6 +8806,8 @@ uint32 Unit::SpellDamageBonusDone(Unit* victim, SpellInfo const* spellProto, uin
+     float ApCoeffMod = 1.0f;
+     int32 DoneTotal = 0;
+     float DoneTotalMod = TotalMod ? TotalMod : SpellPctDamageModsDone(victim, spellProto, damagetype);
++    if (Player* player = GetSpellModOwner())
++        AddPct(DoneTotalMod, player->GetVersatilityDamageAndHealingPct());
+ 
+     // Config : RATE_CREATURE_X_SPELLDAMAGE & Do Not Modify Pet/Guardian/Mind Controlled Damage
+     if (IsCreature() && (!ToCreature()->IsPet() || !ToCreature()->IsGuardian() || !ToCreature()->IsControlledByPlayer()))
+@@ -8927,6 +8960,8 @@ uint32 Unit::SpellDamageBonusTaken(Unit* caster, SpellInfo const* spellProto, ui
+ 
+     int32 TakenTotal = 0;
+     float TakenTotalMod = 1.0f;
++    if (Player* player = GetSpellModOwner())
++        AddPct(TakenTotalMod, -player->GetVersatilityDamageReductionPct());
+ 
+     // from positive and negative SPELL_AURA_MOD_DAMAGE_PERCENT_TAKEN
+     // multiplicative bonus, for example Dispersion + Shadowform (0.10*0.85=0.085)
+@@ -9577,6 +9612,8 @@ uint32 Unit::SpellHealingBonusDone(Unit* victim, SpellInfo const* spellProto, ui
+ 
+     float ApCoeffMod = 1.0f;
+     float DoneTotalMod = TotalMod ? TotalMod : SpellPctHealingModsDone(victim, spellProto, damagetype);
++    if (Player* player = GetSpellModOwner())
++        AddPct(DoneTotalMod, player->GetVersatilityDamageAndHealingPct());
+     int32 DoneTotal = 0;
+ 
+     // done scripted mod (take it from owner)
+@@ -10215,6 +10252,8 @@ uint32 Unit::MeleeDamageBonusDone(Unit* victim, uint32 pdamage, WeaponAttackType
+ 
+     // Done total percent damage auras
+     float DoneTotalMod = 1.0f;
++    if (Player* player = GetSpellModOwner())
++        AddPct(DoneTotalMod, player->GetVersatilityDamageAndHealingPct());
+ 
+     // mods for SPELL_SCHOOL_MASK_NORMAL are already factored in base melee damage calculation
+     if (!(damageSchoolMask & SPELL_SCHOOL_MASK_NORMAL))
+@@ -10363,6 +10402,8 @@ uint32 Unit::MeleeDamageBonusTaken(Unit* attacker, uint32 pdamage, WeaponAttackT
+ 
+     // Taken total percent damage auras
+     float TakenTotalMod = 1.0f;
++    if (Player* player = GetSpellModOwner())
++        AddPct(TakenTotalMod, -player->GetVersatilityDamageReductionPct());
+ 
+     TakenTotalMod *= GetTotalAuraMultiplierByMiscMask(SPELL_AURA_MOD_DAMAGE_PERCENT_TAKEN, damageSchoolMask);
+ 
+@@ -10726,6 +10767,12 @@ bool Unit::IsValidAttackTarget(Unit const* target, SpellInfo const* bySpell) con
+ // function based on function Unit::CanAttack from 13850 client
+ bool Unit::_IsValidAttackTarget(Unit const* target, SpellInfo const* bySpell, WorldObject const* obj) const
+ {
++    Player const* sourcePlayer = GetAffectingPlayer();
++    Player const* targetPlayer = target ? target->GetAffectingPlayer() : nullptr;
++    if (sourcePlayer && targetPlayer && sourcePlayer != targetPlayer &&
++        (sourcePlayer->IsHardcore() || targetPlayer->IsHardcore()))
++        return false;
++
+     ASSERT(target);
+ 
+     // can't attack self
+@@ -10829,6 +10876,24 @@ bool Unit::_IsValidAttackTarget(Unit const* target, SpellInfo const* bySpell, Wo
+     Player const* playerAffectingAttacker = HasUnitFlag(UNIT_FLAG_PLAYER_CONTROLLED) ? GetAffectingPlayer() : nullptr;
+     Player const* playerAffectingTarget = target->HasUnitFlag(UNIT_FLAG_PLAYER_CONTROLLED) ? target->GetAffectingPlayer() : nullptr;
+ 
++    // Protection of the Sunwell is a bilateral PvP exclusion on the outdoor
++    // Isle of Quel'Danas. Resolve through affecting players so pets, charms,
++    // vehicles and area spells obey the same rule as their owners.
++    if (playerAffectingAttacker && playerAffectingTarget)
++    {
++        constexpr uint32 SpellProtectionOfTheSunwell = 80920;
++        constexpr uint32 MapOutland = 530;
++        constexpr uint32 ZoneIsleOfQuelDanas = 4080;
++        auto isProtected = [=](Player const* player)
++        {
++            return player->GetMapId() == MapOutland && player->GetZoneId() == ZoneIsleOfQuelDanas &&
++                player->HasAura(SpellProtectionOfTheSunwell);
++        };
++
++        if (isProtected(playerAffectingAttacker) || isProtected(playerAffectingTarget))
++            return false;
++    }
++
+     // check duel - before sanctuary checks
+     if (playerAffectingAttacker && playerAffectingTarget)
+         if (playerAffectingAttacker->duel && playerAffectingAttacker->duel->Opponent == playerAffectingTarget && playerAffectingAttacker->duel->State == DUEL_STATE_IN_PROGRESS)
+@@ -13229,6 +13294,17 @@ void Unit::AddComboPoints(Unit* target, int8 count)
+         return;
+     }
+ 
++    if (count > 0)
++    {
++        Unit* gainTarget = target ? target : m_comboTarget;
++        if (gainTarget)
++        {
++            int16 previous = gainTarget == m_comboTarget ? m_comboPoints : 0;
++            uint8 overflow = uint8(std::max<int16>(0, previous + count - 5));
++            sScriptMgr->OnComboPointsGain(this, gainTarget, uint8(count), overflow);
++        }
++    }
++
+     if (target && target != m_comboTarget)
+     {
+         if (m_comboTarget)
+@@ -13959,7 +14035,7 @@ bool Unit::HandleAuraRaidProcFromCharge(AuraEffect* triggeredByAura)
+     return true;
+ }
+ 
+-void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackType attackType, SpellInfo const* /*spellProto*/, Spell const* /*spell*/ /*= nullptr*/)
++void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackType attackType, SpellInfo const* spellProto, Spell const* /*spell*/ /*= nullptr*/)
+ {
+     // Prevent killing unit twice (and giving reward from kill twice)
+     if (!victim->GetHealth())
+@@ -14138,6 +14214,8 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
+     if (!spiritOfRedemption)
+     {
+         LOG_DEBUG("entities.unit", "SET DeathState::JustDied");
++        if (Player* hardcoreVictim = victim->ToPlayer())
++            HardcoreRecordDeathWithSource(hardcoreVictim, killer, spellProto);
+         victim->setDeathState(DeathState::JustDied);
+     }
+ 
+@@ -16084,6 +16162,8 @@ void Unit::RewardRage(uint32 damage, uint32 weaponSpeedHitFactor, bool attacker)
+             addRage *= 3.0f;
+     }
+ 
++    if (Player* player = ToPlayer(); player && player->HasHardcorePact(3))
++        addRage *= 1.25f;
+     addRage *= sWorld->getRate(RATE_POWER_RAGE_INCOME);
+ 
+     ModifyPower(POWER_RAGE, uint32(addRage * 10));
+diff --git a/src/server/game/Entities/Unit/Unit.h b/src/server/game/Entities/Unit/Unit.h
+index 7a717918c..28ba42372 100644
+--- a/src/server/game/Entities/Unit/Unit.h
++++ b/src/server/game/Entities/Unit/Unit.h
+@@ -378,6 +378,8 @@ public:
+     [[nodiscard]] uint32 GetHitMask() const;
+     void AddHitMask(uint32 hitMask) { m_hitMask |= hitMask; }
+     [[nodiscard]] uint32 GetUnmitigatedDamage() const;
++    [[nodiscard]] uint32 GetDamageForDerivedEffect() const;
++    [[nodiscard]] uint32 GetUnmitigatedDamageForDerivedEffect() const;
+ };
+ 
+ class HealInfo
+@@ -1406,7 +1408,8 @@ public:
+     void RemoveAurasDueToItemSpell(uint32 spellId, ObjectGuid castItemGuid);
+     void RemoveAurasByType(AuraType auraType, ObjectGuid casterGUID = ObjectGuid::Empty, Aura* except = nullptr, bool negative = true, bool positive = true);
+     void RemoveNotOwnSingleTargetAuras();
+-    void RemoveAurasWithInterruptFlags(uint32 flag, uint32 except = 0, bool isAutoshot = false);
++    void RemoveAurasWithInterruptFlags(uint32 flag, uint32 except = 0, bool isAutoshot = false,
++        DamageEffectType damageType = NODAMAGE, Unit* attacker = nullptr, SpellInfo const* damageSpell = nullptr);
+     void RemoveAurasWithAttribute(uint32 flags);
+     void RemoveAurasWithFamily(SpellFamilyNames family, uint32 familyFlag1, uint32 familyFlag2, uint32 familyFlag3, ObjectGuid casterGUID);
+     void RemoveAurasWithMechanic(uint64 mechanic_mask, AuraRemoveMode removemode = AURA_REMOVE_BY_DEFAULT, uint32 except = 0);
+diff --git a/src/server/game/Groups/Group.cpp b/src/server/game/Groups/Group.cpp
+index 4942bd1ec..48f15fb17 100644
+--- a/src/server/game/Groups/Group.cpp
++++ b/src/server/game/Groups/Group.cpp
+@@ -356,6 +356,21 @@ bool Group::AddInvite(Player* player)
+ {
+     if (!player || player->GetGroupInvite())
+         return false;
++
++    if (!isBGGroup() && !isBFGroup() && !isLFGGroup() && !IsSolitaryActivityGroup())
++    {
++        if (player->IsSolitary())
++            return false;
++
++        for (MemberSlot const& member : m_memberSlots)
++            if (Player* current = ObjectAccessor::FindConnectedPlayer(member.guid); current && current->IsSolitary())
++                return false;
++
++        for (Player* invitee : m_invitees)
++            if (invitee && invitee->IsSolitary())
++                return false;
++    }
++
+     Group* group = player->GetGroup();
+     if (group && (group->isBGGroup() || group->isBFGroup()))
+         group = player->GetOriginalGroup();
+@@ -434,6 +449,20 @@ bool Group::AddMember(Player* player, uint8 roles /* = 0 */)
+     if (!player)
+         return false;
+ 
++    // Invitation/acceptance hooks are intentionally not the authority here:
++    // playerbots and commands can add members directly. Keep the restriction
++    // at the group invariant, while allowing only system-created activity
++    // groups (BG/BF/LFG and the short-lived Solitary arena queue group).
++    if (!isBGGroup() && !isBFGroup() && !isLFGGroup() && !IsSolitaryActivityGroup())
++    {
++        if (player->IsSolitary() && !m_memberSlots.empty())
++            return false;
++
++        for (MemberSlot const& member : m_memberSlots)
++            if (Player* current = ObjectAccessor::FindConnectedPlayer(member.guid); current && current->IsSolitary())
++                return false;
++    }
++
+     // Get first not-full group
+     uint8 subGroup = 0;
+     if (m_subGroupsCounts)
+diff --git a/src/server/game/Groups/Group.h b/src/server/game/Groups/Group.h
+index ebb83b9b6..051c80c08 100644
+--- a/src/server/game/Groups/Group.h
++++ b/src/server/game/Groups/Group.h
+@@ -223,6 +223,8 @@ public:
+     bool isRaidGroup() const;
+     bool isBFGroup()   const;
+     bool isBGGroup()   const;
++    bool IsSolitaryActivityGroup() const { return m_isSolitaryActivityGroup; }
++    void SetSolitaryActivityGroup(bool value) { m_isSolitaryActivityGroup = value; }
+     bool IsCreated()   const;
+     GroupType GetGroupType() const;
+     ObjectGuid GetLeaderGUID() const;
+@@ -375,6 +377,7 @@ protected:
+     uint32              m_counter;                      // used only in SMSG_GROUP_LIST
+     uint32              m_maxEnchantingLevel;
+     uint8               m_lfgGroupFlags;
++    bool                m_isSolitaryActivityGroup = false;
+ 
+     // Xinef: change difficulty prevention
+     uint32 _difficultyChangePreventionTime;
+diff --git a/src/server/game/Handlers/AuctionHouseHandler.cpp b/src/server/game/Handlers/AuctionHouseHandler.cpp
+index bba72f7ff..6fce89f25 100644
+--- a/src/server/game/Handlers/AuctionHouseHandler.cpp
++++ b/src/server/game/Handlers/AuctionHouseHandler.cpp
+@@ -33,6 +33,12 @@
+ //void called when player click on auctioneer npc
+ void WorldSession::HandleAuctionHelloOpcode(WorldPacket& recvData)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     ObjectGuid guid;                                            //NPC guid
+     recvData >> guid;
+ 
+@@ -116,6 +122,12 @@ void WorldSession::SendAuctionOwnerNotification(AuctionEntry* auction)
+ //this void creates new auction and adds auction to some auctionhouse
+ void WorldSession::HandleAuctionSellItem(WorldPacket& recvData)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     ObjectGuid auctioneer;
+     uint32 itemsCount, etime, bid, buyout;
+     recvData >> auctioneer;
+@@ -424,6 +436,12 @@ void WorldSession::HandleAuctionSellItem(WorldPacket& recvData)
+ //this function is called when client bids or buys out auction
+ void WorldSession::HandleAuctionPlaceBid(WorldPacket& recvData)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     ObjectGuid auctioneer;
+     uint32 auctionId;
+     uint32 price;
+@@ -593,6 +611,12 @@ void WorldSession::HandleAuctionPlaceBid(WorldPacket& recvData)
+ //this void is called when auction_owner cancels his auction
+ void WorldSession::HandleAuctionRemoveItem(WorldPacket& recvData)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     ObjectGuid auctioneer;
+     uint32 auctionId;
+     recvData >> auctioneer;
+@@ -670,6 +694,12 @@ void WorldSession::HandleAuctionRemoveItem(WorldPacket& recvData)
+ //called when player lists his bids
+ void WorldSession::HandleAuctionListBidderItems(WorldPacket& recvData)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     ObjectGuid guid;                                            //NPC guid
+     uint32 listfrom;                                        //page of auctions
+     uint32 outbiddedCount;                                  //count of outbidded auctions
+@@ -722,6 +752,12 @@ void WorldSession::HandleAuctionListBidderItems(WorldPacket& recvData)
+ //this void sends player info about his auctions
+ void WorldSession::HandleAuctionListOwnerItems(WorldPacket& recvData)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     ObjectGuid guid;
+     uint32 listfrom;
+ 
+@@ -748,6 +784,12 @@ void WorldSession::HandleAuctionListOwnerItems(WorldPacket& recvData)
+ //this void is called when player clicks on search button
+ void WorldSession::HandleAuctionListItems(WorldPacket& recvData)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     std::string searchedname;
+     uint8 levelmin, levelmax, usable;
+     uint32 listfrom, auctionSlotID, auctionMainCategory, auctionSubCategory, quality;
+@@ -848,6 +890,12 @@ void WorldSession::HandleAuctionListItems(WorldPacket& recvData)
+ 
+ void WorldSession::HandleAuctionListPendingSales(WorldPacket& recvData)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     recvData.read_skip<uint64>();
+ 
+     uint32 count = 0;
+diff --git a/src/server/game/Handlers/BattleGroundHandler.cpp b/src/server/game/Handlers/BattleGroundHandler.cpp
+index a981349fe..09f221946 100644
+--- a/src/server/game/Handlers/BattleGroundHandler.cpp
++++ b/src/server/game/Handlers/BattleGroundHandler.cpp
+@@ -25,6 +25,7 @@
+ #include "DisableMgr.h"
+ #include "GameTime.h"
+ #include "Group.h"
++#include "GroupMgr.h"
+ #include "LFGMgr.h"
+ #include "Language.h"
+ #include "ObjectAccessor.h"
+@@ -34,6 +35,93 @@
+ #include "WorldPacket.h"
+ #include "WorldSession.h"
+ 
++namespace
++{
++    constexpr uint32 SOLO_RATED_ARENA_START_RATING = 1500;
++    constexpr uint32 SOLO_RATED_ARENA_TEAM_ID_BASE = 0xF0000000;
++
++    struct SoloRatedArenaRating
++    {
++        uint32 Rating = SOLO_RATED_ARENA_START_RATING;
++        uint32 MatchmakerRating = SOLO_RATED_ARENA_START_RATING;
++        uint32 VirtualTeamId = 0;
++    };
++
++    SoloRatedArenaRating GetSoloRatedArenaRating(Player const* player, uint8 arenaSlot)
++    {
++        SoloRatedArenaRating result;
++        uint32 const guid = player->GetGUID().GetCounter();
++        result.VirtualTeamId = SOLO_RATED_ARENA_TEAM_ID_BASE + guid * MAX_ARENA_SLOT + arenaSlot;
++
++        CharacterDatabasePreparedStatement* select =
++            CharacterDatabase.GetPreparedStatement(CHAR_SEL_SOLO_ARENA_RATING_BY_GUID_SLOT);
++        select->SetData(0, guid);
++        select->SetData(1, arenaSlot);
++        if (PreparedQueryResult query = CharacterDatabase.Query(select))
++        {
++            Field* fields = query->Fetch();
++            result.Rating = fields[0].Get<uint32>();
++            result.MatchmakerRating = fields[1].Get<uint32>();
++            result.VirtualTeamId = fields[2].Get<uint32>();
++        }
++        else
++        {
++            CharacterDatabasePreparedStatement* insert =
++                CharacterDatabase.GetPreparedStatement(CHAR_INS_SOLO_ARENA_RATING);
++            insert->SetData(0, guid);
++            insert->SetData(1, arenaSlot);
++            insert->SetData(2, result.Rating);
++            insert->SetData(3, result.MatchmakerRating);
++            insert->SetData(4, result.VirtualTeamId);
++            CharacterDatabase.Execute(insert);
++        }
++
++        return result;
++    }
++
++    bool IsServerBot(Player const* player)
++    {
++        return player && player->GetSession() && player->GetSession()->IsBot();
++    }
++
++    bool PrepareSolitaryArenaGroup(Player* player, ObjectGuid battlemasterGuid,
++        uint8 arenaSlot, uint8 teamSize, bool rated)
++    {
++        if (!player || !player->IsSolitary() || teamSize < ARENA_TYPE_2v2)
++            return false;
++
++        Group* group = player->GetGroup();
++        if (group)
++        {
++            bool incompatibleMember = false;
++            group->DoForAllMembers([player, &incompatibleMember](Player* member)
++            {
++                if (member != player && !IsServerBot(member))
++                    incompatibleMember = true;
++            });
++
++            if (!group->IsSolitaryActivityGroup() || incompatibleMember ||
++                !group->IsLeader(player->GetGUID()) || group->GetMembersCount() != teamSize)
++                return false;
++        }
++        else
++        {
++            // The playerbots module owns the whole temporary cohort. Taking an
++            // arbitrary online bot here allowed stale arena-team members with
++            // missing gear or an unprepared AI to enter a Solitary match.
++            sScriptMgr->OnPlayerRequestSolitaryArenaAssistants(player, battlemasterGuid,
++                arenaSlot, teamSize, rated);
++            LOG_INFO("bg.arena", "Solitary arena: requested an isolated {}v{} bot cohort for {} ({})",
++                teamSize, teamSize, player->GetName(), player->GetGUID().ToString());
++            return false;
++        }
++
++        LOG_INFO("bg.arena", "Solitary arena: prepared a temporary {}-player bot team for {} ({})",
++            teamSize, player->GetName(), player->GetGUID().ToString());
++        return true;
++    }
++}
++
+ void WorldSession::HandleBattlemasterHelloOpcode(WorldPacket& recvData)
+ {
+     ObjectGuid guid;
+@@ -706,8 +794,7 @@ void WorldSession::HandleBattlemasterJoinArena(WorldPacket& recvData)
+ 
+     recvData >> guid >> arenaslot >> asGroup >> isRated;
+ 
+-    // can't queue for rated without a group
+-    if (isRated && !asGroup)
++    if (isRated && !asGroup && !_player->IsSolitary())
+         return;
+ 
+     // ignore if we already in BG or BG queue
+@@ -716,7 +803,12 @@ void WorldSession::HandleBattlemasterJoinArena(WorldPacket& recvData)
+ 
+     // find creature by guid
+     Creature* unit = GetPlayer()->GetMap()->GetCreature(guid);
+-    if (!unit || !unit->IsBattleMaster())
++    bool remoteRandomBot = IsBot();
++    // Random bots are queued by the server and can be anywhere in the world;
++    // requiring their fake client packet to see an arena master locally made
++    // every skirmish/rated helper silently fail. Real clients retain the full
++    // proximity and battlemaster validation.
++    if ((!unit || !unit->IsBattleMaster()) && !remoteRandomBot && !_completingSolitaryArenaJoin)
+         return;
+ 
+     // get arena type
+@@ -742,6 +834,22 @@ void WorldSession::HandleBattlemasterJoinArena(WorldPacket& recvData)
+             return;
+     }
+ 
++    bool const solitaryArena = _player->IsSolitary() && !IsBot();
++    if (solitaryArena)
++    {
++        if (!PrepareSolitaryArenaGroup(_player, guid, arenaslot, arenatype, isRated != 0))
++        {
++            ChatHandler(this).SendNotification("Регистрация принята. Боты для режима \"Одиночка\" подготавливаются автоматически.");
++            // Enter a real one-player placeholder queue immediately. This
++            // produces STATUS_WAIT_QUEUE (and therefore the minimap icon)
++            // while the owner-bound cohort is prepared in the background.
++            // The strict Solitary matcher rejects this incomplete side.
++            asGroup = 0;
++        }
++        else
++            asGroup = 1;
++    }
++
+     // get template for all arenas
+     Battleground* bgt = sBattlegroundMgr->GetBattlegroundTemplate(BATTLEGROUND_AA);
+     if (!bgt)
+@@ -789,8 +897,20 @@ void WorldSession::HandleBattlemasterJoinArena(WorldPacket& recvData)
+     BattlegroundQueue& bgQueue = sBattlegroundMgr->GetBattlegroundQueue(bgQueueTypeId);
+ 
+     // check if player can queue:
++    bool soloRated = false;
+     if (!asGroup)
+     {
++        if (isRated)
++        {
++            if (sArenaSeasonMgr->GetSeasonState() == ARENA_SEASON_STATE_DISABLED)
++                return;
++
++            SoloRatedArenaRating const soloRating = GetSoloRatedArenaRating(_player, arenaslot);
++            ateamId = soloRating.VirtualTeamId;
++            arenaRating = std::max<uint32>(1, soloRating.Rating);
++            matchmakerRating = soloRating.MatchmakerRating;
++        }
++
+         lfg::LfgState lfgState = sLFGMgr->GetState(GetPlayer()->GetGUID());
+         if (GetPlayer()->InBattleground()) // currently in battleground
+             err = ERR_BATTLEGROUND_NOT_IN_BATTLEGROUND;
+@@ -821,10 +941,11 @@ void WorldSession::HandleBattlemasterJoinArena(WorldPacket& recvData)
+         uint32 queueSlot = _player->AddBattlegroundQueueId(bgQueueTypeId);
+ 
+         WorldPacket data;
+-        sBattlegroundMgr->BuildBattlegroundStatusPacket(&data, bgt, queueSlot, STATUS_WAIT_QUEUE, avgWaitTime, 0, arenatype, TEAM_NEUTRAL);
++        sBattlegroundMgr->BuildBattlegroundStatusPacket(&data, bgt, queueSlot, STATUS_WAIT_QUEUE, avgWaitTime, 0, arenatype, TEAM_NEUTRAL, isRated != 0);
+         SendPacket(&data);
+ 
+-        LOG_DEBUG("bg.battleground", "Battleground: player joined queue for arena, skirmish, bg queue type {} bg type {}: {}, NAME {}", bgQueueTypeId, bgTypeId, _player->GetGUID().ToString(), _player->GetName());
++        LOG_INFO("bg.arena", "Solo rated queue: player {} ({}) entered {}v{} with virtual team {}, rating {}, MMR {}",
++            _player->GetName(), _player->GetGUID().ToString(), arenatype, arenatype, ateamId, arenaRating, matchmakerRating);
+ 
+         sScriptMgr->OnPlayerJoinArena(_player);
+     }
+@@ -845,24 +966,32 @@ void WorldSession::HandleBattlemasterJoinArena(WorldPacket& recvData)
+ 
+             ateamId = _player->GetArenaTeamId(arenaslot);
+ 
+-            // check team existence
+             ArenaTeam* at = sArenaTeamMgr->GetArenaTeamById(ateamId);
+             if (!at)
+             {
+-                SendNotInArenaTeamPacket(arenatype);
+-                return;
++                if (!solitaryArena)
++                    return;
++
++                SoloRatedArenaRating const soloRating = GetSoloRatedArenaRating(_player, arenaslot);
++                ateamId = soloRating.VirtualTeamId;
++                arenaRating = std::max<uint32>(1, soloRating.Rating);
++                matchmakerRating = soloRating.MatchmakerRating;
++                soloRated = true;
+             }
++            else
++            {
++                // get team rating for queueing
++                arenaRating = at->GetRating();
++                matchmakerRating = at->GetAverageMMR(grp);
++                if (arenaRating <= 0)
++                    arenaRating = 1;
+ 
+-            // get team rating for queueing
+-            arenaRating = at->GetRating();
+-            matchmakerRating = at->GetAverageMMR(grp);
+-            if (arenaRating <= 0)
+-                arenaRating = 1;
+-
+-            previousOpponents = at->GetPreviousOpponents();
++                previousOpponents = at->GetPreviousOpponents();
++            }
+         }
+ 
+-        err = grp->CanJoinBattlegroundQueue(bgt, bgQueueTypeId, arenatype, arenatype, (bool)isRated, arenaslot);
++        if (!soloRated)
++            err = grp->CanJoinBattlegroundQueue(bgt, bgQueueTypeId, arenatype, arenatype, (bool)isRated, arenaslot);
+ 
+         // Check queue group members
+         if (err)
+@@ -920,11 +1049,61 @@ void WorldSession::HandleBattlemasterJoinArena(WorldPacket& recvData)
+ 
+             sScriptMgr->OnPlayerJoinArena(member);
+         }
++
++        if (solitaryArena)
++            grp->Disband();
+     }
+ 
+     sBattlegroundMgr->ScheduleQueueUpdate(matchmakerRating, arenatype, bgQueueTypeId, bgTypeId, bracketEntry->GetBracketId());
+ }
+ 
++void WorldSession::CompletePendingSolitaryArenaJoin(ObjectGuid battlemasterGuid, uint8 arenaSlot, bool rated)
++{
++    if (!_player || !_player->IsSolitary() || _player->InBattleground())
++        return;
++
++    ArenaType arenaType = ARENA_TYPE_NONE;
++    switch (arenaSlot)
++    {
++        case 0:
++            arenaType = ARENA_TYPE_2v2;
++            break;
++        case 1:
++            arenaType = ARENA_TYPE_3v3;
++            break;
++        case 2:
++            arenaType = ARENA_TYPE_5v5;
++            break;
++        default:
++            return;
++    }
++
++    BattlegroundQueueTypeId const queueType =
++        BattlegroundMgr::BGQueueTypeId(BATTLEGROUND_AA, arenaType);
++    BattlegroundQueue& queue = sBattlegroundMgr->GetBattlegroundQueue(queueType);
++    GroupQueueInfo pendingInfo;
++
++    // Completion is valid only while the exact visible one-player placeholder
++    // still exists. If the player cancelled it, never resurrect the request.
++    if (!_player->InBattlegroundQueueForBattlegroundQueueType(queueType) ||
++        !queue.GetPlayerGroupInfoData(_player->GetGUID(), &pendingInfo) ||
++        !pendingInfo.IsSolitary || pendingInfo.IsRated != rated ||
++        pendingInfo.ArenaType != arenaType || pendingInfo.Players.size() != 1)
++        return;
++
++    queue.RemovePlayer(_player->GetGUID(), true);
++    _player->RemoveBattlegroundQueueId(queueType);
++    LOG_INFO("bg.arena", "Solitary arena: replacing visible pending queue with prepared {}v{} cohort for {} ({})",
++        uint32(arenaType), uint32(arenaType), _player->GetName(), _player->GetGUID().ToString());
++
++    WorldPacket packet(CMSG_BATTLEMASTER_JOIN_ARENA, 16);
++    packet << battlemasterGuid << arenaSlot << uint8(1) << uint8(rated ? 1 : 0);
++
++    _completingSolitaryArenaJoin = true;
++    HandleBattlemasterJoinArena(packet);
++    _completingSolitaryArenaJoin = false;
++}
++
+ void WorldSession::HandleReportPvPAFK(WorldPacket& recvData)
+ {
+     ObjectGuid playerGuid;
+diff --git a/src/server/game/Handlers/CharacterHandler.cpp b/src/server/game/Handlers/CharacterHandler.cpp
+index d2457ccda..793ff9e89 100644
+--- a/src/server/game/Handlers/CharacterHandler.cpp
++++ b/src/server/game/Handlers/CharacterHandler.cpp
+@@ -26,6 +26,7 @@
+ #include "CharacterPackets.h"
+ #include "Chat.h"
+ #include "Common.h"
++#include "Config.h"
+ #include "DatabaseEnv.h"
+ #include "GameTime.h"
+ #include "GitRevision.h"
+@@ -277,6 +278,32 @@ void WorldSession::HandleCharCreateOpcode(WorldPacket& recvData)
+         >> createInfo->FacialHair
+         >> createInfo->OutfitId;
+ 
++    // Solitary creation protocol v1: the matched Glue client uses the otherwise
++    // unused outfit byte. Keep intent on this request through all async checks;
++    // never store a pending account/session toggle or encode it in the name.
++    if (recvData.rpos() != recvData.size())
++    {
++        if (recvData.size() - recvData.rpos() != 4 || !(createInfo->OutfitId & 0x40))
++        {
++            SendCharCreate(CHAR_CREATE_ERROR);
++            return;
++        }
++        uint16 magic;
++        recvData >> magic >> createInfo->HardcorePacts;
++        if (magic != 0x504A || !Player::ValidateHardcorePacts(createInfo->HardcorePacts, createInfo->Class))
++        {
++            SendCharCreate(CHAR_CREATE_ERROR);
++            return;
++        }
++    }
++
++    if ((createInfo->OutfitId & ~0xC0) != 0 ||
++        ((createInfo->OutfitId & 0x40) && !sConfigMgr->GetOption<bool>("Hardcore.Enabled", false)))
++    {
++        SendCharCreate(CHAR_CREATE_ERROR);
++        return;
++    }
++
+     if (!HasPermission(rbac::RBAC_PERM_SKIP_CHECK_CHARACTER_CREATION_TEAMMASK))
+     {
+         if (uint32 mask = sWorld->getIntConfig(CONFIG_CHARACTER_CREATING_DISABLED))
+@@ -570,11 +597,26 @@ void WorldSession::HandleCharCreateOpcode(WorldPacket& recvData)
+ 
+                         newChar->SetAtLoginFlag(AT_LOGIN_FIRST);              // First login
+ 
++                        if (createInfo->OutfitId & 0x80)
++                        {
++                            // Create the same persistent aura used by .solitary on
++                            // before SaveToDB, so character and mode commit together.
++                            Aura* mode = newChar->AddAura(Player::SPELL_ID_SOLITARY, newChar.get());
++                            if (!mode || !mode->CanBeSaved() || mode->GetDuration() != -1 || !newChar->IsSolitary())
++                            {
++                                LOG_ERROR("entities.player.character", "Solitary creation aborted: persistent aura unavailable");
++                                SendCharCreate(CHAR_CREATE_ERROR);
++                                return;
++                            }
++                        }
++
+                         CharacterDatabaseTransaction characterTransaction = CharacterDatabase.BeginTransaction();
+                         LoginDatabaseTransaction trans = LoginDatabase.BeginTransaction();
+ 
+                         // Player created, save it now
+                         newChar->SaveToDB(characterTransaction, true, false);
++                        if (createInfo->OutfitId & 0x40)
++                            newChar->AppendHardcoreCreation(characterTransaction, createInfo->HardcorePacts);
+                         createInfo->CharCount++;
+ 
+                         LoginDatabasePreparedStatement* stmt = LoginDatabase.GetPreparedStatement(LOGIN_DEL_REALM_CHARACTERS_BY_REALM);
+diff --git a/src/server/game/Handlers/GuildHandler.cpp b/src/server/game/Handlers/GuildHandler.cpp
+index 8cb95e603..70aa74a8f 100644
+--- a/src/server/game/Handlers/GuildHandler.cpp
++++ b/src/server/game/Handlers/GuildHandler.cpp
+@@ -264,6 +264,12 @@ void WorldSession::HandleGuildEventLogQueryOpcode(WorldPackets::Guild::GuildEven
+ 
+ void WorldSession::HandleGuildBankMoneyWithdrawn(WorldPackets::Guild::GuildBankRemainingWithdrawMoneyQuery& /*packet*/)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     LOG_DEBUG("guild", "MSG_GUILD_BANK_MONEY_WITHDRAWN [{}]", GetPlayerInfo());
+ 
+     if (Guild* guild = GetPlayer()->GetGuild())
+@@ -279,6 +285,12 @@ void WorldSession::HandleGuildPermissions(WorldPackets::Guild::GuildPermissionsQ
+ // Called when clicking on Guild bank gameobject
+ void WorldSession::HandleGuildBankerActivate(WorldPackets::Guild::GuildBankActivate& packet)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     LOG_DEBUG("guild", "CMSG_GUILD_BANKER_ACTIVATE [{}]: Go: [{}] AllSlots: {}"
+     , GetPlayerInfo(), packet.Banker.ToString(), packet.FullUpdate);
+ 
+@@ -299,6 +311,12 @@ void WorldSession::HandleGuildBankerActivate(WorldPackets::Guild::GuildBankActiv
+ // Called when opening guild bank tab only
+ void WorldSession::HandleGuildBankQueryTab(WorldPackets::Guild::GuildBankQueryTab& packet)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     LOG_DEBUG("guild", "CMSG_GUILD_BANK_QUERY_TAB [{}]: Go: [{}], TabId: {}, ShowTabs: {}"
+     , GetPlayerInfo(), packet.Banker.ToString(), packet.Tab, packet.FullUpdate);
+ 
+@@ -309,6 +327,12 @@ void WorldSession::HandleGuildBankQueryTab(WorldPackets::Guild::GuildBankQueryTa
+ 
+ void WorldSession::HandleGuildBankDepositMoney(WorldPackets::Guild::GuildBankDepositMoney& packet)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     LOG_DEBUG("guild", "CMSG_GUILD_BANK_DEPOSIT_MONEY [{}]: Go: [{}], money: {}",
+               GetPlayerInfo(), packet.Banker.ToString(), packet.Money);
+ 
+@@ -320,6 +344,12 @@ void WorldSession::HandleGuildBankDepositMoney(WorldPackets::Guild::GuildBankDep
+ 
+ void WorldSession::HandleGuildBankWithdrawMoney(WorldPackets::Guild::GuildBankWithdrawMoney& packet)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     LOG_DEBUG("guild", "CMSG_GUILD_BANK_WITHDRAW_MONEY [{}]: Go: [{}], money: {}",
+                    GetPlayerInfo(), packet.Banker.ToString(), packet.Money);
+     if (packet.Money && GetPlayer()->GetGameObjectIfCanInteractWith(packet.Banker, GAMEOBJECT_TYPE_GUILD_BANK))
+@@ -329,6 +359,12 @@ void WorldSession::HandleGuildBankWithdrawMoney(WorldPackets::Guild::GuildBankWi
+ 
+ void WorldSession::HandleGuildBankSwapItems(WorldPackets::Guild::GuildBankSwapItems& packet)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     if (!GetPlayer()->GetGameObjectIfCanInteractWith(packet.Banker, GAMEOBJECT_TYPE_GUILD_BANK))
+     {
+         return;
+@@ -368,6 +404,12 @@ void WorldSession::HandleGuildBankSwapItems(WorldPackets::Guild::GuildBankSwapIt
+ 
+ void WorldSession::HandleGuildBankBuyTab(WorldPackets::Guild::GuildBankBuyTab& packet)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     LOG_DEBUG("guild", "CMSG_GUILD_BANK_BUY_TAB [{}]: [{}[, TabId: {}", GetPlayerInfo(), packet.Banker .ToString(), packet.BankTab);
+ 
+     if (GetPlayer()->GetGameObjectIfCanInteractWith(packet.Banker, GAMEOBJECT_TYPE_GUILD_BANK))
+@@ -377,6 +419,12 @@ void WorldSession::HandleGuildBankBuyTab(WorldPackets::Guild::GuildBankBuyTab& p
+ 
+ void WorldSession::HandleGuildBankUpdateTab(WorldPackets::Guild::GuildBankUpdateTab& packet)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     LOG_DEBUG("guild", "CMSG_GUILD_BANK_UPDATE_TAB [{}]: Go: [{}], TabId: {}, Name: {}, Icon: {}"
+     , GetPlayerInfo(), packet.Banker.ToString(), packet.BankTab, packet.Name, packet.Icon);
+ 
+@@ -388,6 +436,12 @@ void WorldSession::HandleGuildBankUpdateTab(WorldPackets::Guild::GuildBankUpdate
+ 
+ void WorldSession::HandleGuildBankLogQuery(WorldPackets::Guild::GuildBankLogQuery& packet)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     LOG_DEBUG("guild", "MSG_GUILD_BANK_LOG_QUERY [{}]: TabId: {}", GetPlayerInfo(), packet.Tab);
+ 
+     if (Guild* guild = GetPlayer()->GetGuild())
+@@ -396,6 +450,12 @@ void WorldSession::HandleGuildBankLogQuery(WorldPackets::Guild::GuildBankLogQuer
+ 
+ void WorldSession::HandleQueryGuildBankTabText(WorldPackets::Guild::GuildBankTextQuery& packet)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     LOG_DEBUG("guild", "MSG_QUERY_GUILD_BANK_TEXT [{}]: TabId: {}", GetPlayerInfo(), packet.Tab);
+ 
+     if (Guild* guild = GetPlayer()->GetGuild())
+@@ -404,6 +464,12 @@ void WorldSession::HandleQueryGuildBankTabText(WorldPackets::Guild::GuildBankTex
+ 
+ void WorldSession::HandleSetGuildBankTabText(WorldPackets::Guild::GuildBankSetTabText& packet)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     LOG_DEBUG("guild", "CMSG_SET_GUILD_BANK_TEXT [{}]: TabId: {}, Text: {}", GetPlayerInfo(), packet.Tab, packet.TabText);
+ 
+     if (Guild* guild = GetPlayer()->GetGuild())
+diff --git a/src/server/game/Handlers/ItemHandler.cpp b/src/server/game/Handlers/ItemHandler.cpp
+index 93430dbe9..f51c6c641 100644
+--- a/src/server/game/Handlers/ItemHandler.cpp
++++ b/src/server/game/Handlers/ItemHandler.cpp
+@@ -31,6 +31,12 @@
+ 
+ #include "ItemPackets.h"
+ 
++namespace
++{
++constexpr uint32 BLACK_DIAMOND_FIRST_ITEM = 900200;
++constexpr uint32 BLACK_DIAMOND_LAST_ITEM = 900218;
++}
++
+ void WorldSession::HandleSplitItemOpcode(WorldPackets::Item::SplitItem& packet)
+ {
+     //LOG_DEBUG("network.opcode", "WORLD: CMSG_SPLIT_ITEM");
+@@ -1362,6 +1368,47 @@ void WorldSession::HandleSocketOpcode(WorldPackets::Item::SocketGems& packet)
+         }
+     }
+ 
++    std::vector<Item*> recoveredBlackDiamonds;
++    for (int i = 0; i < MAX_GEM_SOCKETS; ++i)
++    {
++        if (!GemEnchants[i] || !OldEnchants[i])
++            continue;
++
++        SpellItemEnchantmentEntry const* oldEnchant = sSpellItemEnchantmentStore.LookupEntry(OldEnchants[i]);
++        if (!oldEnchant || oldEnchant->GemID < BLACK_DIAMOND_FIRST_ITEM ||
++            oldEnchant->GemID > BLACK_DIAMOND_LAST_ITEM)
++            continue;
++
++        ItemPosCountVec destination;
++        InventoryResult result = _player->CanStoreNewItem(NULL_BAG, NULL_SLOT, destination, oldEnchant->GemID, 1);
++        if (result != EQUIP_ERR_OK)
++        {
++            for (Item* recoveredItem : recoveredBlackDiamonds)
++            {
++                uint32 count = 1;
++                _player->DestroyItemCount(recoveredItem, count, true);
++            }
++
++            _player->SendEquipError(result, itemTarget, nullptr, oldEnchant->GemID);
++            return;
++        }
++
++        Item* recoveredItem = _player->StoreNewItem(destination, oldEnchant->GemID, true);
++        if (!recoveredItem)
++        {
++            for (Item* storedItem : recoveredBlackDiamonds)
++            {
++                uint32 count = 1;
++                _player->DestroyItemCount(storedItem, count, true);
++            }
++
++            _player->SendEquipError(EQUIP_ERR_INVENTORY_FULL, itemTarget, nullptr, oldEnchant->GemID);
++            return;
++        }
++
++        recoveredBlackDiamonds.push_back(recoveredItem);
++    }
++
+     bool SocketBonusActivated = itemTarget->GemsFitSockets();    //save state of socketbonus
+     _player->ToggleMetaGemsActive(slot, false);             //turn off all metagems (except for the target item)
+ 
+@@ -1377,7 +1424,7 @@ void WorldSession::HandleSocketOpcode(WorldPackets::Item::SocketGems& packet)
+         {
+             itemTarget->SetEnchantment(EnchantmentSlot(SOCK_ENCHANTMENT_SLOT + i), GemEnchants[i], 0, 0, _player->GetGUID());
+             if (Item* guidItem = _player->GetItemByGuid(packet.GemGuids[i]))
+-                _player->DestroyItem(guidItem->GetBagSlot(), guidItem->GetSlot(), true);
++                _player->DestroyItemCount(guidItem->GetEntry(), 1, true);
+         }
+     }
+ 
+diff --git a/src/server/game/Handlers/LootHandler.cpp b/src/server/game/Handlers/LootHandler.cpp
+index a18781f0e..f9a135270 100644
+--- a/src/server/game/Handlers/LootHandler.cpp
++++ b/src/server/game/Handlers/LootHandler.cpp
+@@ -231,6 +231,8 @@ void WorldSession::HandleLootMoneyOpcode(WorldPacket& /*recvData*/)
+                         continue;
+                 }
+ 
++                if (guid.IsCreature() && (*i)->HasHardcorePact(5))
++                    finalGold += finalGold / 2;
+                 (*i)->ModifyMoney(finalGold);
+                 (*i)->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_LOOT_MONEY, finalGold);
+ 
+@@ -258,6 +260,8 @@ void WorldSession::HandleLootMoneyOpcode(WorldPacket& /*recvData*/)
+ 
+             if (award)
+             {
++                if (guid.IsCreature() && player->HasHardcorePact(5))
++                    finalGold += finalGold / 2;
+                 player->ModifyMoney(finalGold);
+                 player->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_LOOT_MONEY, finalGold);
+ 
+diff --git a/src/server/game/Handlers/MailHandler.cpp b/src/server/game/Handlers/MailHandler.cpp
+index e70a9d94f..7ae79e33a 100644
+--- a/src/server/game/Handlers/MailHandler.cpp
++++ b/src/server/game/Handlers/MailHandler.cpp
+@@ -64,6 +64,12 @@ bool WorldSession::CanOpenMailBox(ObjectGuid guid)
+ 
+ void WorldSession::HandleSendMail(WorldPacket& recvData)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     ObjectGuid mailbox;
+     uint64 unk3;
+     std::string receiver, subject, body;
+@@ -143,6 +149,12 @@ void WorldSession::HandleSendMail(WorldPacket& recvData)
+         player->SendMailResult(0, MAIL_SEND, MAIL_ERR_RECIPIENT_NOT_FOUND);
+         return;
+     }
++    if (Player::IsHardcoreCharacter(receiverGuid))
++    {
++        player->SendMailResult(0, MAIL_SEND, MAIL_ERR_RECIPIENT_NOT_FOUND);
++        return;
++    }
++
+ 
+     LOG_DEBUG("network.opcode", "Player {} is sending mail to {} ({}) with subject {} and body {} includes {} items, {} copper and {} COD copper with unk1 = {}, unk2 = {}",
+         player->GetGUID().ToString(), receiver, receiverGuid.ToString(), subject, body, items_count, money, COD, unk1, unk2);
+@@ -382,6 +394,12 @@ void WorldSession::HandleSendMail(WorldPacket& recvData)
+ //called when mail is read
+ void WorldSession::HandleMailMarkAsRead(WorldPacket& recvData)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     ObjectGuid mailbox;
+     uint32 mailId;
+     recvData >> mailbox;
+@@ -405,6 +423,12 @@ void WorldSession::HandleMailMarkAsRead(WorldPacket& recvData)
+ //called when client deletes mail
+ void WorldSession::HandleMailDelete(WorldPacket& recvData)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     ObjectGuid mailbox;
+     uint32 mailId;
+     recvData >> mailbox;
+@@ -435,6 +459,12 @@ void WorldSession::HandleMailDelete(WorldPacket& recvData)
+ 
+ void WorldSession::HandleMailReturnToSender(WorldPacket& recvData)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     ObjectGuid mailbox;
+     uint32 mailId;
+     recvData >> mailbox;
+@@ -516,6 +546,12 @@ void WorldSession::HandleMailReturnToSender(WorldPacket& recvData)
+ //called when player takes item attached in mail
+ void WorldSession::HandleMailTakeItem(WorldPacket& recvData)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     ObjectGuid mailbox;
+     uint32 mailId;
+     uint32 itemLowGuid;
+@@ -630,6 +666,12 @@ void WorldSession::HandleMailTakeItem(WorldPacket& recvData)
+ 
+ void WorldSession::HandleMailTakeMoney(WorldPacket& recvData)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     ObjectGuid mailbox;
+     uint32 mailId;
+     recvData >> mailbox;
+@@ -675,6 +717,12 @@ void WorldSession::HandleMailTakeMoney(WorldPacket& recvData)
+ //called when player lists his received mails
+ void WorldSession::HandleGetMailList(WorldPacket& recvData)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     ObjectGuid mailbox;
+     recvData >> mailbox;
+ 
+@@ -803,6 +851,12 @@ void WorldSession::HandleGetMailList(WorldPacket& recvData)
+ //used when player copies mail body to his inventory
+ void WorldSession::HandleMailCreateTextItem(WorldPacket& recvData)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     ObjectGuid mailbox;
+     uint32 mailId;
+ 
+@@ -870,6 +924,12 @@ void WorldSession::HandleMailCreateTextItem(WorldPacket& recvData)
+ //TODO Fix me! ... this void has probably bad condition, but good data are sent
+ void WorldSession::HandleQueryNextMailTime(WorldPacket& /*recvData*/)
+ {
++    if (_player->IsHardcore())
++    {
++        SendAreaTriggerMessage("В Хардкоре почта, аукцион и банк гильдии недоступны.");
++        return;
++    }
++
+     WorldPacket data(MSG_QUERY_NEXT_MAIL_TIME, 8);
+ 
+     if (_player->unReadMails > 0)
+diff --git a/src/server/game/Handlers/SpellHandler.cpp b/src/server/game/Handlers/SpellHandler.cpp
+index a69c15045..ec63fded9 100644
+--- a/src/server/game/Handlers/SpellHandler.cpp
++++ b/src/server/game/Handlers/SpellHandler.cpp
+@@ -572,6 +572,11 @@ void WorldSession::HandleCancelAuraOpcode(WorldPacket& recvPacket)
+     if (!spellInfo)
+         return;
+ 
++    // Одиночка is an account-mode status, not a player-cancellable effect.
++    // Keep this fail-closed guard even if a client DBC patch is absent or stale.
++    if (spellId == Player::SPELL_ID_SOLITARY)
++        return;
++
+     // not allow remove spells with attr SPELL_ATTR0_NO_AURA_CANCEL
+     if (spellInfo->HasAttribute(SPELL_ATTR0_NO_AURA_CANCEL))
+     {
+diff --git a/src/server/game/Handlers/TradeHandler.cpp b/src/server/game/Handlers/TradeHandler.cpp
+index 991d6211c..65d7559f2 100644
+--- a/src/server/game/Handlers/TradeHandler.cpp
++++ b/src/server/game/Handlers/TradeHandler.cpp
+@@ -241,6 +241,14 @@ void WorldSession::HandleAcceptTradeOpcode(WorldPacket& /*recvPacket*/)
+         return;
+ 
+     Player* trader = my_trade->GetTrader();
++    if ((_player->IsHardcore() || trader->IsHardcore()) &&
++        (!_player->IsHardcore() || !trader->IsHardcore() || !_player->IsAlive() || !trader->IsAlive() ||
++         _player->IsHardcoreFallen() || trader->IsHardcoreFallen()))
++    {
++        _player->TradeCancel(true);
++        return;
++    }
++
+ 
+     TradeData* his_trade = trader->m_trade;
+     if (!his_trade)
+diff --git a/src/server/game/Maps/MapMgr.cpp b/src/server/game/Maps/MapMgr.cpp
+index 46f627a10..3496ff033 100644
+--- a/src/server/game/Maps/MapMgr.cpp
++++ b/src/server/game/Maps/MapMgr.cpp
+@@ -169,7 +169,8 @@ Map::EnterState MapMgr::PlayerCannotEnter(uint32 mapid, Player* player, bool log
+     if (entry->IsRaid())
+     {
+         // can only enter in a raid group
+-        if ((!group || !group->isRaidGroup()) && !sWorld->getBoolConfig(CONFIG_INSTANCE_IGNORE_RAID))
++        if ((!group || !group->isRaidGroup()) && !player->IsSolitary() &&
++            !sWorld->getBoolConfig(CONFIG_INSTANCE_IGNORE_RAID))
+         {
+             // probably there must be special opcode, because client has this string constant in GlobalStrings.lua
+             /// @todo: this is not a good place to send the message
+diff --git a/src/server/game/Movement/MovementGenerators/WaypointMovementGenerator.cpp b/src/server/game/Movement/MovementGenerators/WaypointMovementGenerator.cpp
+index 27c2cc45b..6830d159b 100644
+--- a/src/server/game/Movement/MovementGenerators/WaypointMovementGenerator.cpp
++++ b/src/server/game/Movement/MovementGenerators/WaypointMovementGenerator.cpp
+@@ -678,7 +678,7 @@ void FlightPathMovementGenerator::DoFinalize(Player* player)
+     player->RemovePlayerFlag(PLAYER_FLAGS_TAXI_BENCHMARK);
+ }
+ 
+-#define PLAYER_FLIGHT_SPEED 32.0f
++#define PLAYER_FLIGHT_SPEED 320.0f
+ 
+ void FlightPathMovementGenerator::DoReset(Player* player)
+ {
+diff --git a/src/server/game/Scripting/ScriptDefines/AllSpellScript.cpp b/src/server/game/Scripting/ScriptDefines/AllSpellScript.cpp
+index d47939fe0..2953357b3 100644
+--- a/src/server/game/Scripting/ScriptDefines/AllSpellScript.cpp
++++ b/src/server/game/Scripting/ScriptDefines/AllSpellScript.cpp
+@@ -89,6 +89,55 @@ void ScriptMgr::OnSpellPrepare(Spell* spell, Unit* caster, SpellInfo const* spel
+     CALL_ENABLED_HOOKS(AllSpellScript, ALLSPELLHOOK_ON_PREPARE, script->OnSpellPrepare(spell, caster, spellInfo));
+ }
+ 
++bool ScriptMgr::CanCastWhileMoving(Spell* spell)
++{
++    CALL_ENABLED_BOOLEAN_HOOKS_WITH_DEFAULT_FALSE(AllSpellScript, ALLSPELLHOOK_CAN_CAST_WHILE_MOVING, script->CanCastWhileMoving(spell));
++}
++
++void ScriptMgr::ModifyPowerCost(Spell* spell, int32& powerCost)
++{
++    CALL_ENABLED_HOOKS(AllSpellScript, ALLSPELLHOOK_MODIFY_POWER_COST, script->ModifyPowerCost(spell, powerCost));
++}
++
++void ScriptMgr::ModifyCritChance(Spell* spell, Unit* target, float& critChance)
++{
++    CALL_ENABLED_HOOKS(AllSpellScript, ALLSPELLHOOK_MODIFY_CRIT_CHANCE, script->ModifyCritChance(spell, target, critChance));
++}
++
++void ScriptMgr::OnCritResult(Spell* spell, Unit* target, bool critical)
++{
++    CALL_ENABLED_HOOKS(AllSpellScript, ALLSPELLHOOK_ON_CRIT_RESULT, script->OnCritResult(spell, target, critical));
++}
++
++void ScriptMgr::ModifyDispelCharges(Spell* spell, Aura const* aura, uint8& charges)
++{
++    CALL_ENABLED_HOOKS(AllSpellScript, ALLSPELLHOOK_MODIFY_DISPEL_CHARGES, script->ModifyDispelCharges(spell, aura, charges));
++}
++
++void ScriptMgr::ModifyItemCombatSpellChance(Player* player, Unit* target, SpellInfo const* spellInfo, float& chance)
++{
++    CALL_ENABLED_HOOKS(AllSpellScript, ALLSPELLHOOK_MODIFY_ITEM_COMBAT_SPELL_CHANCE,
++        script->ModifyItemCombatSpellChance(player, target, spellInfo, chance));
++}
++
++void ScriptMgr::ModifySpellHitResult(Spell* spell, Unit* target, SpellMissInfo& missInfo)
++{
++    CALL_ENABLED_HOOKS(AllSpellScript, ALLSPELLHOOK_MODIFY_SPELL_HIT_RESULT,
++        script->ModifySpellHitResult(spell, target, missInfo));
++}
++
++bool ScriptMgr::CanRemoveAuraOnDamage(Unit* victim, Aura const* aura, Unit* attacker, SpellInfo const* damageSpell,
++    DamageEffectType damageType)
++{
++    CALL_ENABLED_BOOLEAN_HOOKS(AllSpellScript, ALLSPELLHOOK_CAN_REMOVE_AURA_ON_DAMAGE,
++        !script->CanRemoveAuraOnDamage(victim, aura, attacker, damageSpell, damageType));
++}
++
++void ScriptMgr::ModifyDamage(Unit* attacker, Unit* victim, SpellInfo const* spellInfo, DamageEffectType damageType, uint32& damage)
++{
++    CALL_ENABLED_HOOKS(AllSpellScript, ALLSPELLHOOK_MODIFY_DAMAGE, script->ModifyDamage(attacker, victim, spellInfo, damageType, damage));
++}
++
+ AllSpellScript::AllSpellScript(char const* name, std::vector<uint16> enabledHooks)
+     : ScriptObject(name, ALLSPELLHOOK_END)
+ {
+@@ -100,4 +149,54 @@ AllSpellScript::AllSpellScript(char const* name, std::vector<uint16> enabledHook
+     ScriptRegistry<AllSpellScript>::AddScript(this, std::move(enabledHooks));
+ }
+ 
++void ScriptMgr::ModifyThreat(Unit* source, Unit* threatened, SpellInfo const* spellInfo, float& threat)
++{
++    CALL_ENABLED_HOOKS(AllSpellScript, ALLSPELLHOOK_MODIFY_THREAT, script->ModifyThreat(source, threatened, spellInfo, threat));
++}
++
++bool ScriptMgr::CanDispelAura(Unit* target, Aura const* aura, Unit* dispeller, SpellInfo const* spell)
++{
++    CALL_ENABLED_BOOLEAN_HOOKS(AllSpellScript, ALLSPELLHOOK_CAN_DISPEL_AURA,
++        !script->CanDispelAura(target, aura, dispeller, spell));
++}
++
++void ScriptMgr::BeforeFallDamage(Player* player, uint32 rawDamage, uint32& damage)
++{
++    CALL_ENABLED_HOOKS(AllSpellScript, ALLSPELLHOOK_BEFORE_FALL_DAMAGE, script->BeforeFallDamage(player, rawDamage, damage));
++}
++
++void ScriptMgr::AfterFallDamage(Player* player, uint32 rawDamage, uint32 damage)
++{
++    CALL_ENABLED_HOOKS(AllSpellScript, ALLSPELLHOOK_AFTER_FALL_DAMAGE, script->AfterFallDamage(player, rawDamage, damage));
++}
++
++void ScriptMgr::OnAuraDamageBreak(Unit* target, Aura const* aura, Unit* attacker, SpellInfo const* spell, DamageEffectType type)
++{
++    CALL_ENABLED_HOOKS(AllSpellScript, ALLSPELLHOOK_AURA_DAMAGE_BREAK, script->OnAuraDamageBreak(target, aura, attacker, spell, type));
++}
++
++void ScriptMgr::ModifySpellImpactDamage(Spell* spell, Unit* target, int32& damage, bool critical)
++{
++    CALL_ENABLED_HOOKS(AllSpellScript, ALLSPELLHOOK_SPELL_IMPACT_DAMAGE,
++        script->ModifySpellImpactDamage(spell, target, damage, critical));
++}
++
++void ScriptMgr::BeforeDiminishing(Spell* spell, Unit* target, int32& duration, int32& limit)
++{
++    CALL_ENABLED_HOOKS(AllSpellScript, ALLSPELLHOOK_BEFORE_DIMINISHING,
++        script->BeforeDiminishing(spell, target, duration, limit));
++}
++
++void ScriptMgr::ModifyCastRange(Spell* spell, Unit* target, float& minimum, float& maximum)
++{
++    CALL_ENABLED_HOOKS(AllSpellScript, ALLSPELLHOOK_MODIFY_CAST_RANGE,
++        script->ModifyCastRange(spell, target, minimum, maximum));
++}
++
++void ScriptMgr::ModifyCooldown(Player* player, SpellInfo const* spellInfo, int32& recoveryTime, int32& categoryRecoveryTime)
++{
++    CALL_ENABLED_HOOKS(AllSpellScript, ALLSPELLHOOK_MODIFY_COOLDOWN,
++        script->ModifyCooldown(player, spellInfo, recoveryTime, categoryRecoveryTime));
++}
++
+ template class AC_GAME_API ScriptRegistry<AllSpellScript>;
+diff --git a/src/server/game/Scripting/ScriptDefines/AllSpellScript.h b/src/server/game/Scripting/ScriptDefines/AllSpellScript.h
+index 1354502e9..67ce69623 100644
+--- a/src/server/game/Scripting/ScriptDefines/AllSpellScript.h
++++ b/src/server/game/Scripting/ScriptDefines/AllSpellScript.h
+@@ -19,6 +19,7 @@
+ #define SCRIPT_OBJECT_ALL_SPELL_SCRIPT_H_
+ 
+ #include "ScriptObject.h"
++#include "SharedDefines.h"
+ #include <vector>
+ 
+ enum AllSpellHook
+@@ -37,6 +38,24 @@ enum AllSpellHook
+     ALLSPELLHOOK_ON_CAST_CANCEL,
+     ALLSPELLHOOK_ON_CAST,
+     ALLSPELLHOOK_ON_PREPARE,
++    ALLSPELLHOOK_CAN_CAST_WHILE_MOVING,
++    ALLSPELLHOOK_MODIFY_POWER_COST,
++    ALLSPELLHOOK_MODIFY_CRIT_CHANCE,
++    ALLSPELLHOOK_ON_CRIT_RESULT,
++    ALLSPELLHOOK_MODIFY_DISPEL_CHARGES,
++    ALLSPELLHOOK_MODIFY_ITEM_COMBAT_SPELL_CHANCE,
++    ALLSPELLHOOK_MODIFY_SPELL_HIT_RESULT,
++    ALLSPELLHOOK_CAN_REMOVE_AURA_ON_DAMAGE,
++    ALLSPELLHOOK_MODIFY_DAMAGE,
++    ALLSPELLHOOK_MODIFY_THREAT,
++    ALLSPELLHOOK_CAN_DISPEL_AURA,
++    ALLSPELLHOOK_BEFORE_FALL_DAMAGE,
++    ALLSPELLHOOK_AFTER_FALL_DAMAGE,
++    ALLSPELLHOOK_AURA_DAMAGE_BREAK,
++    ALLSPELLHOOK_SPELL_IMPACT_DAMAGE,
++    ALLSPELLHOOK_BEFORE_DIMINISHING,
++    ALLSPELLHOOK_MODIFY_CAST_RANGE,
++    ALLSPELLHOOK_MODIFY_COOLDOWN,
+     ALLSPELLHOOK_END
+ };
+ 
+@@ -103,6 +122,44 @@ public:
+     virtual void OnSpellCast(Spell* /*spell*/, Unit* /*caster*/, SpellInfo const* /*spellInfo*/, bool /*skipCheck*/) { }
+ 
+     virtual void OnSpellPrepare(Spell* /*spell*/, Unit* /*caster*/, SpellInfo const* /*spellInfo*/) { }
++
++    [[nodiscard]] virtual bool CanCastWhileMoving(Spell* /*spell*/) { return false; }
++
++    // Called after the core and SpellMod system calculate the final resource
++    // cost, but before the cast checks and spends that resource.
++    virtual void ModifyPowerCost(Spell* /*spell*/, int32& /*powerCost*/) { }
++
++    // Called after caster/target critical-strike modifiers and before the roll.
++    virtual void ModifyCritChance(Spell* /*spell*/, Unit* /*target*/, float& /*critChance*/) { }
++
++    virtual void OnCritResult(Spell* /*spell*/, Unit* /*target*/, bool /*critical*/) { }
++
++    virtual void ModifyDispelCharges(Spell* /*spell*/, Aura const* /*aura*/, uint8& /*charges*/) { }
++
++    virtual void ModifyItemCombatSpellChance(Player* /*player*/, Unit* /*target*/, SpellInfo const* /*spellInfo*/, float& /*chance*/) { }
++
++    virtual void ModifySpellHitResult(Spell* /*spell*/, Unit* /*target*/, SpellMissInfo& /*missInfo*/) { }
++
++    [[nodiscard]] virtual bool CanRemoveAuraOnDamage(Unit* /*victim*/, Aura const* /*aura*/, Unit* /*attacker*/,
++        SpellInfo const* /*damageSpell*/, DamageEffectType /*damageType*/) { return true; }
++
++    virtual void ModifyDamage(Unit* /*attacker*/, Unit* /*victim*/, SpellInfo const* /*spellInfo*/, DamageEffectType /*damageType*/, uint32& /*damage*/) { }
++    virtual void ModifyThreat(Unit* /*source*/, Unit* /*threatened*/, SpellInfo const* /*spellInfo*/, float& /*threat*/) { }
++    virtual bool CanDispelAura(Unit* /*target*/, Aura const* /*aura*/, Unit* /*dispeller*/, SpellInfo const* /*spell*/) { return true; }
++    virtual void BeforeFallDamage(Player* /*player*/, uint32 /*rawDamage*/, uint32& /*damage*/) { }
++    virtual void AfterFallDamage(Player* /*player*/, uint32 /*rawDamage*/, uint32 /*damage*/) { }
++    virtual void OnAuraDamageBreak(Unit* /*target*/, Aura const* /*aura*/, Unit* /*attacker*/,
++        SpellInfo const* /*spell*/, DamageEffectType /*type*/) { }
++    // Successful, non-immune impact before armor, critical scaling, absorb and combat log.
++    virtual void ModifySpellImpactDamage(Spell* /*spell*/, Unit* /*target*/, int32& /*damage*/, bool /*critical*/) { }
++    virtual void BeforeDiminishing(Spell* /*spell*/, Unit* /*target*/, int32& /*duration*/, int32& /*limit*/) { }
++    virtual void ModifyCastRange(Spell* /*spell*/, Unit* /*target*/, float& /*minimum*/, float& /*maximum*/) { }
++    // Called after native cooldown modifiers and before cooldown storage.
++    virtual void ModifyCooldown(Player* /*player*/, SpellInfo const* /*spellInfo*/, int32& /*recoveryTime*/, int32& /*categoryRecoveryTime*/) { }
++
++    // Called while serializing the already mitigated damage value. It must not
++    // alter server health; it keeps client combat text/logs aligned with a late
++    // gameplay modifier applied by ModifyDamage in Unit::DealDamage.
+ };
+ 
+ // Compatibility for old scripts
+diff --git a/src/server/game/Scripting/ScriptDefines/PlayerScript.cpp b/src/server/game/Scripting/ScriptDefines/PlayerScript.cpp
+index 5fb008665..c2f8fafba 100644
+--- a/src/server/game/Scripting/ScriptDefines/PlayerScript.cpp
++++ b/src/server/game/Scripting/ScriptDefines/PlayerScript.cpp
+@@ -368,6 +368,12 @@ void ScriptMgr::OnPlayerGetMaxPersonalArenaRatingRequirement(Player const* playe
+     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_GET_MAX_PERSONAL_ARENA_RATING_REQUIREMENT, script->OnPlayerGetMaxPersonalArenaRatingRequirement(player, minSlot, maxArenaRating));
+ }
+ 
++bool ScriptMgr::OnPlayerHasQuestForItem(Player const* player, uint32 itemId, bool* showInLoot)
++{
++    CALL_ENABLED_BOOLEAN_HOOKS_WITH_DEFAULT_FALSE(PlayerScript, PLAYERHOOK_ON_HAS_QUEST_FOR_ITEM,
++        script->OnPlayerHasQuestForItem(player, itemId, showInLoot));
++}
++
+ void ScriptMgr::OnPlayerLootItem(Player* player, Item* item, uint32 count, ObjectGuid lootguid)
+ {
+     CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_ON_LOOT_ITEM, script->OnPlayerLootItem(player, item, count, lootguid));
+@@ -503,6 +509,13 @@ bool ScriptMgr::OnPlayerCanJoinInArenaQueue(Player* player, ObjectGuid Battlemas
+     CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_CAN_JOIN_IN_ARENA_QUEUE, !script->OnPlayerCanJoinInArenaQueue(player, BattlemasterGuid, arenaslot, BGTypeID, joinAsGroup, IsRated, err));
+ }
+ 
++void ScriptMgr::OnPlayerRequestSolitaryArenaAssistants(Player* player, ObjectGuid battlemasterGuid,
++    uint8 arenaSlot, uint8 teamSize, bool rated)
++{
++    CALL_ENABLED_HOOKS(PlayerScript, PLAYERHOOK_CAN_JOIN_IN_ARENA_QUEUE,
++        script->OnPlayerRequestSolitaryArenaAssistants(player, battlemasterGuid, arenaSlot, teamSize, rated));
++}
++
+ bool ScriptMgr::OnPlayerCanBattleFieldPort(Player* player, uint8 arenaType, BattlegroundTypeId BGTypeID, uint8 action)
+ {
+     CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_CAN_BATTLEFIELD_PORT, !script->OnPlayerCanBattleFieldPort(player, arenaType, BGTypeID, action));
+@@ -972,3 +985,9 @@ PlayerScript::PlayerScript(char const* name, std::vector<uint16> enabledHooks)
+ }
+ 
+ template class AC_GAME_API ScriptRegistry<PlayerScript>;
++
++bool ScriptMgr::OnPlayerBeforeLoadActionButton(Player* player, uint8 button, uint32& action, uint8& type)
++{
++    CALL_ENABLED_BOOLEAN_HOOKS(PlayerScript, PLAYERHOOK_ON_BEFORE_LOAD_ACTION_BUTTON,
++        !script->OnPlayerBeforeLoadActionButton(player, button, action, type));
++}
+diff --git a/src/server/game/Scripting/ScriptDefines/PlayerScript.h b/src/server/game/Scripting/ScriptDefines/PlayerScript.h
+index 3c3ec7d2f..f48fe97ed 100644
+--- a/src/server/game/Scripting/ScriptDefines/PlayerScript.h
++++ b/src/server/game/Scripting/ScriptDefines/PlayerScript.h
+@@ -103,6 +103,7 @@ enum PlayerHook
+     PLAYERHOOK_GET_CUSTOM_GET_ARENA_TEAM_ID,
+     PLAYERHOOK_GET_CUSTOM_ARENA_PERSONAL_RATING,
+     PLAYERHOOK_ON_GET_MAX_PERSONAL_ARENA_RATING_REQUIREMENT,
++    PLAYERHOOK_ON_HAS_QUEST_FOR_ITEM,
+     PLAYERHOOK_ON_LOOT_ITEM,
+     PLAYERHOOK_ON_BEFORE_FILL_QUEST_LOOT_ITEM,
+     PLAYERHOOK_ON_STORE_NEW_ITEM,
+@@ -221,6 +222,7 @@ enum PlayerHook
+     PLAYERHOOK_ON_GET_REPUTATION_PRICE_DISCOUNT,
+     PLAYERHOOK_ON_LEARN_TAXI_NODE,
+     PLAYERHOOK_ON_BEFORE_GET_LEVEL_FOR_XP_GAIN,
++    PLAYERHOOK_ON_BEFORE_LOAD_ACTION_BUTTON,
+     PLAYERHOOK_END
+ };
+ 
+@@ -429,6 +431,10 @@ public:
+     //Called after the normal slots (0..2) for arena have been evaluated so that custom arena teams could modify it if nececasry
+     virtual void OnPlayerGetMaxPersonalArenaRatingRequirement(Player const* /*player*/, uint32 /*minSlot*/, uint32& /*maxArenaRating*/) const {}
+ 
++    // Allows external quest systems to expose a required item through the normal quest-loot pipeline.
++    [[nodiscard]] virtual bool OnPlayerHasQuestForItem(Player const* /*player*/, uint32 /*itemId*/,
++        bool* /*showInLoot*/) { return false; }
++
+     //After looting item
+     virtual void OnPlayerLootItem(Player* /*player*/, Item* /*item*/, uint32 /*count*/, ObjectGuid /*lootguid*/) { }
+ 
+@@ -501,6 +507,10 @@ public:
+ 
+     [[nodiscard]] virtual bool OnPlayerCanJoinInArenaQueue(Player* /*player*/, ObjectGuid /*BattlemasterGuid*/, uint8 /*arenaslot*/, BattlegroundTypeId /*BGTypeID*/, uint8 /*joinAsGroup*/, uint8 /*IsRated*/, GroupJoinBattlegroundResult& /*err*/) { return true; }
+ 
++    // Called when a solitary arena registration needs temporary bot teammates.
++    virtual void OnPlayerRequestSolitaryArenaAssistants(Player* /*player*/, ObjectGuid /*battlemasterGuid*/,
++        uint8 /*arenaSlot*/, uint8 /*teamSize*/, bool /*rated*/) { }
++
+     [[nodiscard]] virtual bool OnPlayerCanBattleFieldPort(Player* /*player*/, uint8 /*arenaType*/, BattlegroundTypeId /*BGTypeID*/, uint8 /*action*/) { return true; }
+ 
+     [[nodiscard]] virtual bool OnPlayerCanGroupInvite(Player* /*player*/, std::string& /*membername*/) { return true; }
+@@ -860,6 +870,8 @@ public:
+      * @param level The level that should be used for XP gain calculations
+      */
+     virtual void OnPlayerBeforeGetLevelForXPGain(Player const* /*player*/, uint8& /*level*/) {}
++    // Transform a persisted button before spell validation; false discards it.
++    virtual bool OnPlayerBeforeLoadActionButton(Player* /*player*/, uint8 /*button*/, uint32& /*action*/, uint8& /*type*/) { return true; }
+ };
+ 
+ #endif
+diff --git a/src/server/game/Scripting/ScriptDefines/UnitScript.cpp b/src/server/game/Scripting/ScriptDefines/UnitScript.cpp
+index eb365fdcb..9f3668e7f 100644
+--- a/src/server/game/Scripting/ScriptDefines/UnitScript.cpp
++++ b/src/server/game/Scripting/ScriptDefines/UnitScript.cpp
+@@ -19,6 +19,11 @@
+ #include "ScriptMgr.h"
+ #include "ScriptMgrMacros.h"
+ 
++void ScriptMgr::OnComboPointsGain(Unit* unit, Unit* target, uint8 gain, uint8 overflow)
++{
++    CALL_ENABLED_HOOKS(UnitScript, UNITHOOK_ON_COMBO_POINTS_GAIN, script->OnComboPointsGain(unit, target, gain, overflow));
++}
++
+ void ScriptMgr::OnHeal(Unit* healer, Unit* reciever, uint32& gain)
+ {
+     CALL_ENABLED_HOOKS(UnitScript, UNITHOOK_ON_HEAL, script->OnHeal(healer, reciever, gain));
+@@ -39,6 +44,11 @@ void ScriptMgr::ModifyMeleeDamage(Unit* target, Unit* attacker, uint32& damage)
+     CALL_ENABLED_HOOKS(UnitScript, UNITHOOK_MODIFY_MELEE_DAMAGE, script->ModifyMeleeDamage(target, attacker, damage));
+ }
+ 
++void ScriptMgr::ModifyPeriodicCombatDamage(Unit* target, Unit* attacker, uint32& damage, SpellInfo const* spellInfo)
++{
++    CALL_ENABLED_HOOKS(UnitScript, UNITHOOK_MODIFY_PERIODIC_COMBAT_DAMAGE, script->ModifyPeriodicCombatDamage(target, attacker, damage, spellInfo));
++}
++
+ void ScriptMgr::ModifySpellDamageTaken(Unit* target, Unit* attacker, int32& damage, SpellInfo const* spellInfo)
+ {
+     CALL_ENABLED_HOOKS(UnitScript, UNITHOOK_MODIFY_SPELL_DAMAGE_TAKEN, script->ModifySpellDamageTaken(target, attacker, damage, spellInfo));
+diff --git a/src/server/game/Scripting/ScriptDefines/UnitScript.h b/src/server/game/Scripting/ScriptDefines/UnitScript.h
+index 8df6eea40..61c38eea2 100644
+--- a/src/server/game/Scripting/ScriptDefines/UnitScript.h
++++ b/src/server/game/Scripting/ScriptDefines/UnitScript.h
+@@ -44,6 +44,8 @@ enum UnitHook
+     UNITHOOK_ON_UNIT_EXIT_COMBAT,
+     UNITHOOK_ON_UNIT_DEATH,
+     UNITHOOK_ON_UNIT_SET_SHAPESHIFT_FORM,
++    UNITHOOK_MODIFY_PERIODIC_COMBAT_DAMAGE,
++    UNITHOOK_ON_COMBO_POINTS_GAIN,
+     UNITHOOK_END
+ };
+ 
+@@ -67,6 +69,9 @@ public:
+     // Attacker can be nullptr if he is despawned while the aura still exists on target
+     virtual void ModifyPeriodicDamageAurasTick(Unit* /*target*/, Unit* /*attacker*/, uint32& /*damage*/, SpellInfo const* /*spellInfo*/) { }
+ 
++    // Damage-only periodic event; unlike the legacy hook above, never called for healing.
++    virtual void ModifyPeriodicCombatDamage(Unit* /*target*/, Unit* /*attacker*/, uint32& /*damage*/, SpellInfo const* /*spellInfo*/) { }
++
+     // Called when Melee Damage is being Dealt
+     virtual void ModifyMeleeDamage(Unit* /*target*/, Unit* /*attacker*/, uint32& /*damage*/) { }
+ 
+@@ -110,6 +115,9 @@ public:
+     virtual void OnUnitExitCombat(Unit* /*unit*/) { }
+     virtual void OnUnitDeath(Unit* /*unit*/, Unit* /*killer*/) { }
+     virtual void OnUnitSetShapeshiftForm(Unit* /*unit*/, uint8 /*form*/) { }
++
++    // Observe the native gain before its cap discards excess points.
++    virtual void OnComboPointsGain(Unit* /*unit*/, Unit* /*target*/, uint8 /*gain*/, uint8 /*overflow*/) { }
+ };
+ 
+ #endif
+diff --git a/src/server/game/Scripting/ScriptMgr.h b/src/server/game/Scripting/ScriptMgr.h
+index e9c6292d2..e28cc8f0a 100644
+--- a/src/server/game/Scripting/ScriptMgr.h
++++ b/src/server/game/Scripting/ScriptMgr.h
+@@ -331,6 +331,7 @@ public: /* PlayerScript */
+     void OnPlayerTalentsReset(Player* player, bool noCost);
+     bool OnPlayerCanLearnTalent(Player* player, TalentEntry const* talent, uint32 rank);
+     void OnPlayerAfterSpecSlotChanged(Player* player, uint8 newSlot);
++    bool OnPlayerBeforeLoadActionButton(Player* player, uint8 button, uint32& action, uint8& type);
+     void OnPlayerMoneyChanged(Player* player, int32& amount);
+     void OnPlayerBeforeLootMoney(Player* player, Loot* loot);
+     void OnPlayerBeforeSendLoot(Player* player, ObjectGuid lootGuid, Loot* loot);
+@@ -379,6 +380,7 @@ public: /* PlayerScript */
+     void OnPlayerJoinBG(Player* player);
+     void OnPlayerJoinArena(Player* player);
+     void OnPlayerGetMaxPersonalArenaRatingRequirement(Player const* player, uint32 minSlot, uint32& maxArenaRating) const;
++    bool OnPlayerHasQuestForItem(Player const* player, uint32 itemId, bool* showInLoot);
+     void OnPlayerLootItem(Player* player, Item* item, uint32 count, ObjectGuid lootguid);
+     void OnPlayerBeforeFillQuestLootItem(Player* player, LootItem& item);
+     void OnPlayerStoreNewItem(Player* player, Item* item, uint32 count);
+@@ -409,6 +411,8 @@ public: /* PlayerScript */
+     void OnPlayerAfterGuardianInitStatsForLevel(Player* player, Guardian* guardian);
+     void OnPlayerBeforeLoadPetFromDB(Player* player, uint32& petentry, uint32& petnumber, bool& current, bool& forceLoadFromDB);
+     bool OnPlayerCanJoinInArenaQueue(Player* player, ObjectGuid BattlemasterGuid, uint8 arenaslot, BattlegroundTypeId BGTypeID, uint8 joinAsGroup, uint8 IsRated, GroupJoinBattlegroundResult& err);
++    void OnPlayerRequestSolitaryArenaAssistants(Player* player, ObjectGuid battlemasterGuid,
++        uint8 arenaSlot, uint8 teamSize, bool rated);
+     bool OnPlayerCanBattleFieldPort(Player* player, uint8 arenaType, BattlegroundTypeId BGTypeID, uint8 action);
+     bool OnPlayerCanGroupInvite(Player* player, std::string& membername);
+     bool OnPlayerCanGroupAccept(Player* player, Group* group);
+@@ -569,6 +573,7 @@ public: /* UnitScript */
+     void OnHeal(Unit* healer, Unit* reciever, uint32& gain);
+     void OnDamage(Unit* attacker, Unit* victim, uint32& damage);
+     void ModifyPeriodicDamageAurasTick(Unit* target, Unit* attacker, uint32& damage, SpellInfo const* spellInfo);
++    void ModifyPeriodicCombatDamage(Unit* target, Unit* attacker, uint32& damage, SpellInfo const* spellInfo);
+     void ModifyMeleeDamage(Unit* target, Unit* attacker, uint32& damage);
+     void ModifySpellDamageTaken(Unit* target, Unit* attacker, int32& damage, SpellInfo const* spellInfo);
+     void ModifyHealReceived(Unit* target, Unit* healer, uint32& addHealth, SpellInfo const* spellInfo);
+@@ -587,6 +592,7 @@ public: /* UnitScript */
+     void OnUnitEnterCombat(Unit* unit, Unit* victim);
+     void OnUnitExitCombat(Unit* unit);
+     void OnUnitDeath(Unit* unit, Unit* killer);
++    void OnComboPointsGain(Unit* unit, Unit* target, uint8 gain, uint8 overflow);
+     void OnUnitSetShapeshiftForm(Unit* unit, uint8 form);
+ 
+ public: /* MovementHandlerScript */
+@@ -660,6 +666,24 @@ public: /* SpellSC */
+     void OnSpellCastCancel(Spell* spell, Unit* caster, SpellInfo const* spellInfo, bool bySelf);
+     void OnSpellCast(Spell* spell, Unit* caster, SpellInfo const* spellInfo, bool skipCheck);
+     void OnSpellPrepare(Spell* spell, Unit* caster, SpellInfo const* spellInfo);
++    bool CanCastWhileMoving(Spell* spell);
++    void ModifyPowerCost(Spell* spell, int32& powerCost);
++    void ModifyCritChance(Spell* spell, Unit* target, float& critChance);
++    void OnCritResult(Spell* spell, Unit* target, bool critical);
++    void ModifyDispelCharges(Spell* spell, Aura const* aura, uint8& charges);
++    void ModifyItemCombatSpellChance(Player* player, Unit* target, SpellInfo const* spellInfo, float& chance);
++    void ModifySpellHitResult(Spell* spell, Unit* target, SpellMissInfo& missInfo);
++    bool CanRemoveAuraOnDamage(Unit* victim, Aura const* aura, Unit* attacker, SpellInfo const* damageSpell, DamageEffectType damageType);
++    bool CanDispelAura(Unit* target, Aura const* aura, Unit* dispeller, SpellInfo const* spell);
++    void BeforeFallDamage(Player* player, uint32 rawDamage, uint32& damage);
++    void AfterFallDamage(Player* player, uint32 rawDamage, uint32 damage);
++    void OnAuraDamageBreak(Unit* target, Aura const* aura, Unit* attacker, SpellInfo const* spell, DamageEffectType type);
++    void ModifySpellImpactDamage(Spell* spell, Unit* target, int32& damage, bool critical);
++    void BeforeDiminishing(Spell* spell, Unit* target, int32& duration, int32& limit);
++    void ModifyCastRange(Spell* spell, Unit* target, float& minimum, float& maximum);
++    void ModifyCooldown(Player* player, SpellInfo const* spellInfo, int32& recoveryTime, int32& categoryRecoveryTime);
++    void ModifyDamage(Unit* attacker, Unit* victim, SpellInfo const* spellInfo, DamageEffectType damageType, uint32& damage);
++    void ModifyThreat(Unit* source, Unit* threatened, SpellInfo const* spellInfo, float& threat);
+ 
+ public: /* GameEventScript */
+     void OnGameEventStart(uint16 EventID);
+diff --git a/src/server/game/Server/WorldSession.h b/src/server/game/Server/WorldSession.h
+index 1fa64d589..6970a5d7d 100644
+--- a/src/server/game/Server/WorldSession.h
++++ b/src/server/game/Server/WorldSession.h
+@@ -379,6 +379,7 @@ protected:
+     uint8 HairColor = 0;
+     uint8 FacialHair = 0;
+     uint8 OutfitId = 0;
++    uint16 HardcorePacts = 0;
+ 
+     /// Server side data
+     uint8 CharCount = 0;
+@@ -1055,6 +1056,7 @@ public:                                                 // opcodes handlers
+     void HandleBattlefieldListOpcode(WorldPacket& recvData);
+     void HandleBattlefieldLeaveOpcode(WorldPacket& recvData);
+     void HandleBattlemasterJoinArena(WorldPacket& recvData);
++    void CompletePendingSolitaryArenaJoin(ObjectGuid battlemasterGuid, uint8 arenaSlot, bool rated);
+     void HandleReportPvPAFK(WorldPacket& recvData);
+ 
+     void HandleWardenDataOpcode(WorldPacket& recvData);
+@@ -1349,6 +1351,7 @@ private:
+     uint32 _orderCounter;
+ 
+     bool _isBot;
++    bool _completingSolitaryArenaJoin = false;
+ 
+     WorldSession(WorldSession const& right) = delete;
+     WorldSession& operator=(WorldSession const& right) = delete;
+diff --git a/src/server/game/Spells/Auras/SpellAuraEffects.cpp b/src/server/game/Spells/Auras/SpellAuraEffects.cpp
+index 8a4b34da5..fd25489dc 100644
+--- a/src/server/game/Spells/Auras/SpellAuraEffects.cpp
++++ b/src/server/game/Spells/Auras/SpellAuraEffects.cpp
+@@ -1211,6 +1211,9 @@ bool AuraEffect::CheckEffectProc(AuraApplication* aurApp, ProcEventInfo& eventIn
+             DamageInfo* damageInfo = eventInfo.GetDamageInfo();
+             if (!damageInfo || !damageInfo->GetDamage())
+                 return false;
++            if (!sScriptMgr->CanRemoveAuraOnDamage(aurApp->GetTarget(), GetBase(), eventInfo.GetActor(),
++                spellInfo, damageInfo->GetDamageType()))
++                return false;
+ 
+             // Spell own damage at apply won't break CC
+             if (spellInfo && spellInfo == GetSpellInfo())
+@@ -6334,6 +6337,7 @@ void AuraEffect::HandlePeriodicDamageAurasTick(Unit* target, Unit* caster) const
+ 
+     // Script Hook For HandlePeriodicDamageAurasTick -- Allow scripts to change the Damage pre class mitigation calculations
+     sScriptMgr->ModifyPeriodicDamageAurasTick(target, caster, damage, GetSpellInfo());
++    sScriptMgr->ModifyPeriodicCombatDamage(target, caster, damage, GetSpellInfo());
+ 
+     if (target->GetAI())
+     {
+@@ -6447,6 +6451,7 @@ void AuraEffect::HandlePeriodicHealthLeechAuraTick(Unit* target, Unit* caster) c
+ 
+     // Script Hook For HandlePeriodicHealthLeechAurasTick -- Allow scripts to change the Damage pre class mitigation calculations
+     sScriptMgr->ModifyPeriodicDamageAurasTick(target, caster, damage, GetSpellInfo());
++    sScriptMgr->ModifyPeriodicCombatDamage(target, caster, damage, GetSpellInfo());
+ 
+     if (target->GetAI())
+     {
+@@ -6897,7 +6902,11 @@ void AuraEffect::HandleBreakableCCAuraProc(AuraApplication* aurApp, ProcEventInf
+     int32 const damageLeft = GetAmount() - static_cast<int32>(eventInfo.GetDamageInfo()->GetDamage());
+ 
+     if (damageLeft <= 0)
++    {
++        sScriptMgr->OnAuraDamageBreak(aurApp->GetTarget(), GetBase(), eventInfo.GetActor(),
++            eventInfo.GetSpellInfo(), eventInfo.GetDamageInfo()->GetDamageType());
+         aurApp->GetTarget()->RemoveAura(aurApp);
++    }
+     else
+         SetAmount(damageLeft);
+ }
+diff --git a/src/server/game/Spells/Auras/SpellAuras.cpp b/src/server/game/Spells/Auras/SpellAuras.cpp
+index d539ea79f..c20b52668 100644
+--- a/src/server/game/Spells/Auras/SpellAuras.cpp
++++ b/src/server/game/Spells/Auras/SpellAuras.cpp
+@@ -804,11 +804,12 @@ int32 Aura::CalcMaxDuration(Unit* caster) const
+     if (IsPassive() && !m_spellInfo->DurationEntry)
+         maxDuration = -1;
+ 
+-    sScriptMgr->OnCalcMaxDuration(this, maxDuration);
+-
+     // IsPermanent() checks max duration (which we are supposed to calculate here)
+     if (maxDuration != -1 && modOwner)
+         modOwner->ApplySpellMod(GetId(), SPELLMOD_DURATION, maxDuration);
++    // Final-duration policies must see talent/glyph duration modifiers. Target
++    // diminishing returns and immunities are still applied by the normal path.
++    sScriptMgr->OnCalcMaxDuration(this, maxDuration);
+     return maxDuration;
+ }
+ 
+@@ -2835,7 +2836,9 @@ void UnitAura::FillTargetMap(std::map<Unit*, uint8>& targets, Unit* caster)
+                     case SPELL_EFFECT_APPLY_AREA_AURA_RAID:
+                         {
+                             targetList.push_back(GetUnitOwner());
+-                            Acore::AnyGroupedUnitInObjectRangeCheck u_check(GetUnitOwner(), GetUnitOwner(), radius, GetSpellInfo()->Effects[effIndex].Effect == SPELL_EFFECT_APPLY_AREA_AURA_RAID);
++                            bool raidWide = GetSpellInfo()->Effects[effIndex].Effect == SPELL_EFFECT_APPLY_AREA_AURA_RAID ||
++                                GetSpellInfo()->IsRaidWidePartySpell();
++                            Acore::AnyGroupedUnitInObjectRangeCheck u_check(GetUnitOwner(), GetUnitOwner(), radius, raidWide);
+                             Acore::UnitListSearcher<Acore::AnyGroupedUnitInObjectRangeCheck> searcher(GetUnitOwner(), targetList, u_check);
+                             Cell::VisitObjects(GetUnitOwner(), searcher, radius);
+                             break;
+diff --git a/src/server/game/Spells/Spell.cpp b/src/server/game/Spells/Spell.cpp
+index d155bc6c0..d50e34a49 100644
+--- a/src/server/game/Spells/Spell.cpp
++++ b/src/server/game/Spells/Spell.cpp
+@@ -1355,7 +1355,12 @@ void Spell::SelectImplicitAreaTargets(SpellEffIndex effIndex, SpellImplicitTarge
+             break;
+     }
+ 
+-    SearchAreaTargets(targets, radius, center, referer, targetType.GetObjectType(), targetType.GetCheckType(), m_spellInfo->Effects[effIndex].ImplicitTargetConditions, Acore::WorldObjectSpellAreaTargetSearchReason::Area);
++    SpellTargetCheckTypes checkType = targetType.GetCheckType();
++    if (checkType == TARGET_CHECK_PARTY && m_spellInfo->IsRaidWidePartySpell())
++        checkType = TARGET_CHECK_RAID;
++
++    SearchAreaTargets(targets, radius, center, referer, targetType.GetObjectType(), checkType,
++        m_spellInfo->Effects[effIndex].ImplicitTargetConditions, Acore::WorldObjectSpellAreaTargetSearchReason::Area);
+ 
+     CallScriptObjectAreaTargetSelectHandlers(targets, effIndex, targetType);
+ 
+@@ -2397,7 +2402,9 @@ void Spell::AddUnitTarget(Unit* target, uint32 effectMask, bool checkIfValid /*=
+     // Calculate hit result
+     if (m_originalCaster)
+     {
+-        targetInfo.missCondition = m_originalCaster->SpellHitResult(target, this, m_canReflect);
++        SpellMissInfo missCondition = m_originalCaster->SpellHitResult(target, this, m_canReflect);
++        sScriptMgr->ModifySpellHitResult(this, target, missCondition);
++        targetInfo.missCondition = missCondition;
+         if (m_skipCheck && targetInfo.missCondition != SPELL_MISS_IMMUNE)
+         {
+             targetInfo.missCondition = SPELL_MISS_NONE;
+@@ -2825,6 +2832,7 @@ void Spell::DoAllEffectOnTarget(TargetInfo* target)
+         }
+         else
+         {
++            sScriptMgr->ModifySpellImpactDamage(this, unitTarget, m_damage, target->crit);
+             // Add bonuses and fill damageInfo struct
+             // Dancing Rune Weapon...
+             if (m_caster->GetEntry() == 27893)
+@@ -3157,6 +3165,7 @@ SpellMissInfo Spell::DoSpellHitOnUnit(Unit* unit, uint32 effectMask, bool scaleA
+                 // Now Reduce spell duration using data received at spell hit
+                 int32 duration = m_spellAura->GetMaxDuration();
+                 int32 limitduration = GetDiminishingReturnsLimitDuration(m_diminishGroup, aurSpellInfo);
++                sScriptMgr->BeforeDiminishing(this, unit, duration, limitduration);
+ 
+                 // Xinef: if unit == caster - test versus original unit if available
+                 float diminishMod = 1.0f;
+@@ -3514,6 +3523,8 @@ SpellCastResult Spell::prepare(SpellCastTargets const* targets, AuraEffect const
+     OnSpellLaunch();
+ 
+     m_powerCost = m_CastItem ? 0 : m_spellInfo->CalcPowerCost(m_caster, m_spellSchoolMask, this);
++    sScriptMgr->ModifyPowerCost(this, m_powerCost);
++    m_powerCost = std::max<int32>(0, m_powerCost);
+ 
+     // Set combo point requirement
+     if (HasTriggeredCastFlag(TRIGGERED_IGNORE_COMBO_POINTS) || m_CastItem)
+@@ -3554,7 +3565,9 @@ SpellCastResult Spell::prepare(SpellCastTargets const* targets, AuraEffect const
+ 
+     // don't allow channeled spells / spells with cast time to be casted while moving
+     // (even if they are interrupted on moving, spells with almost immediate effect get to have their effect processed before movement interrupter kicks in)
+-    if ((m_spellInfo->IsChanneled() || m_casttime) && m_caster->IsPlayer() && m_caster->isMoving() && m_spellInfo->InterruptFlags & SPELL_INTERRUPT_FLAG_MOVEMENT && !IsTriggered())
++    if ((m_spellInfo->IsChanneled() || m_casttime) && m_caster->IsPlayer() && m_caster->isMoving() &&
++        m_spellInfo->InterruptFlags & SPELL_INTERRUPT_FLAG_MOVEMENT && !IsTriggered() &&
++        !sScriptMgr->CanCastWhileMoving(this))
+     {
+         // 1. Has casttime, 2. Or doesn't have flag to allow action during channel
+         if (m_casttime || !m_spellInfo->IsActionAllowedChannel())
+@@ -4400,7 +4413,8 @@ void Spell::update(uint32 difftime)
+     // check if the player caster has moved before the spell finished
+     // xinef: added preparing state (real cast, skip channels as they have other flags for this)
+     if ((m_caster->IsPlayer() && m_timer != 0) &&
+-            m_caster->isMoving() && (m_spellInfo->InterruptFlags & SPELL_INTERRUPT_FLAG_MOVEMENT) && m_spellState == SPELL_STATE_PREPARING &&
++            m_caster->isMoving() && (m_spellInfo->InterruptFlags & SPELL_INTERRUPT_FLAG_MOVEMENT) &&
++            m_spellState == SPELL_STATE_PREPARING && !sScriptMgr->CanCastWhileMoving(this) &&
+             (m_spellInfo->Effects[0].Effect != SPELL_EFFECT_STUCK || !m_caster->HasUnitMovementFlag(MOVEMENTFLAG_FALLING_FAR)))
+     {
+         // don't cancel for melee, autorepeat, triggered and instant spells
+@@ -7091,6 +7105,7 @@ SpellCastResult Spell::CheckRange(bool strict)
+     Unit* target = m_targets.GetUnitTarget();
+     float max_range = m_caster->GetSpellMaxRangeForTarget(target, m_spellInfo);
+     float min_range = m_caster->GetSpellMinRangeForTarget(target, m_spellInfo);
++    sScriptMgr->ModifyCastRange(this, target, min_range, max_range);
+ 
+     // xinef: hack for npc shooters
+     if (min_range && GetCaster()->IsCreature() && !GetCaster()->GetOwnerGUID().IsPlayer() && min_range <= 6.0f)
+@@ -8425,7 +8440,9 @@ void Spell::DoAllEffectOnLaunchTarget(TargetInfo& targetInfo, float* multiplier)
+ 
+     float critChance = caster->SpellDoneCritChance(unit, m_spellInfo, m_spellSchoolMask, m_attackType, false);
+     critChance = unit->SpellTakenCritChance(caster, m_spellInfo, m_spellSchoolMask, critChance, m_attackType, false);
++    sScriptMgr->ModifyCritChance(this, unit, critChance);
+     targetInfo.crit = roll_chance_f(std::max(0.0f, critChance));
++    sScriptMgr->OnCritResult(this, unit, targetInfo.crit);
+ }
+ 
+ SpellCastResult Spell::CanOpenLock(uint32 effIndex, uint32 lockId, SkillType& skillId, int32& reqSkillValue, int32& skillValue)
+diff --git a/src/server/game/Spells/SpellEffects.cpp b/src/server/game/Spells/SpellEffects.cpp
+index 207bdd554..f2589fa82 100644
+--- a/src/server/game/Spells/SpellEffects.cpp
++++ b/src/server/game/Spells/SpellEffects.cpp
+@@ -2677,6 +2677,7 @@ void Spell::EffectDispel(SpellEffIndex effIndex)
+     dataSuccess << uint32(success_list.size());            // count
+     for (DispelChargesList::iterator itr = success_list.begin(); itr != success_list.end(); ++itr)
+     {
++        sScriptMgr->ModifyDispelCharges(this, itr->first, itr->second);
+         // Send dispelled spell info
+         dataSuccess << uint32(itr->first->GetId());              // Spell Id
+         dataSuccess << uint8(0);                        // 0 - dispelled !=0 cleansed
+diff --git a/src/server/game/Spells/SpellInfo.cpp b/src/server/game/Spells/SpellInfo.cpp
+index 3494dc9c0..0f54f8d9d 100644
+--- a/src/server/game/Spells/SpellInfo.cpp
++++ b/src/server/game/Spells/SpellInfo.cpp
+@@ -1062,6 +1062,91 @@ bool SpellInfo::IsTargetingArea() const
+     return false;
+ }
+ 
++bool SpellInfo::IsRaidWidePartySpell() const
++{
++    switch (Id)
++    {
++        // Priest: Prayer of Healing and the healing half of Holy Nova.
++        case 596:
++        case 996:
++        case 10960:
++        case 10961:
++        case 23455:
++        case 23458:
++        case 23459:
++        case 25308:
++        case 25316:
++        case 25329:
++        case 27803:
++        case 27804:
++        case 27805:
++        case 48072:
++        case 48075:
++        case 48076:
++            return true;
++        // Priest: Vampiric Embrace triggered party heal.
++        case 15290:
++            return true;
++        // Druid: Tranquility channel auras and their triggered heals.
++        case 740:
++        case 8918:
++        case 9862:
++        case 9863:
++        case 26983:
++        case 44203:
++        case 44205:
++        case 44206:
++        case 44207:
++        case 44208:
++        case 48444:
++        case 48445:
++        case 48446:
++        case 48447:
++            return true;
++        // Shaman: Tremor, Cleansing, Grounding, Mana Tide, Mana Spring and Healing Stream totems.
++        case 8146:
++        case 8171:
++        case 8178:
++        case 39610:
++        case 52031:
++        case 52033:
++        case 52034:
++        case 52035:
++        case 52036:
++        case 52041:
++        case 52046:
++        case 52047:
++        case 52048:
++        case 52049:
++        case 52050:
++        case 58759:
++        case 58760:
++        case 58761:
++        case 58778:
++        case 58779:
++        case 58780:
++            return true;
++        // Warrior: Improved Spell Reflection.
++        case 59725:
++            return true;
++        // Rogue: Honor Among Thieves.
++        case 51698:
++        case 51700:
++        case 51701:
++            return true;
++        // Paladin: Crusader Aura's third effect and Divine Sacrifice.
++        case 32223:
++        case 64205:
++            return true;
++        // Death Knight: Anti-Magic Zone and Glyph of Rune Tap.
++        case 50461:
++        case 59754:
++            return true;
++        default:
++            return false;
++    }
++}
++
+ bool SpellInfo::NeedsExplicitUnitTarget() const
+ {
+     return GetExplicitTargetMask() & TARGET_FLAG_UNIT_MASK;
+diff --git a/src/server/game/Spells/SpellInfo.h b/src/server/game/Spells/SpellInfo.h
+index 022a6d028..af6aa8c80 100644
+--- a/src/server/game/Spells/SpellInfo.h
++++ b/src/server/game/Spells/SpellInfo.h
+@@ -460,6 +460,7 @@ public:
+ 
+     bool IsAffectingArea() const;
+     bool IsTargetingArea() const;
++    bool IsRaidWidePartySpell() const;
+     bool NeedsExplicitUnitTarget() const;
+     bool NeedsToBeTriggeredByCaster(SpellInfo const* triggeringSpell, uint8 effIndex = MAX_SPELL_EFFECTS) const;
+     bool IsChannelCategorySpell() const;
+diff --git a/src/server/scripts/Commands/cs_misc.cpp b/src/server/scripts/Commands/cs_misc.cpp
+index 6d8f75176..d34ea08d7 100644
+--- a/src/server/scripts/Commands/cs_misc.cpp
++++ b/src/server/scripts/Commands/cs_misc.cpp
+@@ -155,6 +155,7 @@ public:
+             { "unbindsight",       HandleUnbindSightCommand,       rbac::RBAC_PERM_COMMAND_UNBINDSIGHT,       Console::No  },
+             { "playall",           HandlePlayAllCommand,           rbac::RBAC_PERM_COMMAND_PLAYALL,           Console::No  },
+             { "skirmish",          HandleSkirmishCommand,          rbac::RBAC_PERM_COMMAND_SKIRMISH,          Console::No  },
++            { "pvpport",           HandlePvpPortCommand,            rbac::RBAC_PERM_COMMAND_SKIRMISH,          Console::No  },
+             { "mailbox",           HandleMailBoxCommand,           rbac::RBAC_PERM_COMMAND_MAILBOX,           Console::No  },
+             { "string",            HandleStringCommand,            rbac::RBAC_PERM_COMMAND_STRING,            Console::No  },
+             { "opendoor",          HandleOpenDoorCommand,          rbac::RBAC_PERM_COMMAND_OPENDOOR,          Console::No  },
+@@ -165,6 +166,79 @@ public:
+         return commandTable;
+     }
+ 
++    static bool HandlePvpPortCommand(ChatHandler* handler, uint32 bgTypeIdRaw)
++    {
++        WorldSession* session = handler->GetSession();
++        if (!session)
++            return false;
++
++        Player* player = session->GetPlayer();
++        if (!player || !player->IsInWorld() || player->IsBeingTeleported() ||
++            player->GetMap()->GetEntry()->Instanceable() || player->InBattlegroundQueue())
++        {
++            handler->SendErrorMessage("Player must be in the open world and outside battleground queues.");
++            return false;
++        }
++
++        bool const isArena = bgTypeIdRaw == 870 || bgTypeIdRaw == 871;
++        if (bgTypeIdRaw != 108 && bgTypeIdRaw != 120 && !isArena)
++        {
++            handler->SendErrorMessage("Supported ids: 108 Twin Peaks, 120 Battle for Gilneas, 870 Tol'Viron, 871 Tiger's Peak.");
++            return false;
++        }
++
++        // BattlegroundTypeId is uint8 in the 3.3.5a core. Keep the convenient
++        // user-facing port numbers while mapping the two custom arenas to free
++        // internal IDs that can actually be represented by the core.
++        BattlegroundTypeId bgTypeId = bgTypeIdRaw == 870 ? BattlegroundTypeId(102) :
++            bgTypeIdRaw == 871 ? BattlegroundTypeId(103) : BattlegroundTypeId(bgTypeIdRaw);
++
++        Battleground* bgTemplate = sBattlegroundMgr->GetBattlegroundTemplate(bgTypeId);
++        if (!bgTemplate)
++        {
++            handler->PSendSysMessage("Battleground template {} is not loaded.", bgTypeIdRaw);
++            return false;
++        }
++
++        PvPDifficultyEntry const* bracket = GetBattlegroundBracketByLevel(bgTemplate->GetMapId(), player->GetLevel());
++        if (!bracket)
++        {
++            handler->PSendSysMessage("No PvP bracket for map {} and level {}.", bgTemplate->GetMapId(), player->GetLevel());
++            return false;
++        }
++
++        Battleground* bg = sBattlegroundMgr->CreateNewBattleground(bgTypeId, bracket, isArena ? ARENA_TYPE_2v2 : ARENA_TYPE_NONE, false);
++        if (!bg)
++        {
++            handler->PSendSysMessage("Could not create battleground {}.", bgTypeIdRaw);
++            return false;
++        }
++
++        bg->StartBattleground();
++        TeamId teamId = player->GetTeamId(true);
++        player->SetEntryPoint();
++
++        uint32 queueSlot = 0;
++        WorldPacket data;
++        sBattlegroundMgr->BuildBattlegroundStatusPacket(&data, bg, queueSlot, STATUS_IN_PROGRESS, 0,
++            bg->GetStartTime(), bg->GetArenaType(), teamId);
++        player->SendDirectMessage(&data);
++        sLFGMgr->LeaveAllLfgQueues(player->GetGUID(), false);
++
++        bg->IncreaseInvitedCount(teamId);
++        player->SetBattlegroundId(bg->GetInstanceID(), bg->GetBgTypeID(), queueSlot, true, false, teamId);
++        if (!sBattlegroundMgr->SendToBattleground(player, bg->GetInstanceID(), bg->GetBgTypeID()))
++        {
++            bg->DecreaseInvitedCount(teamId);
++            player->SetBattlegroundId(0, BATTLEGROUND_TYPE_NONE, PLAYER_MAX_BATTLEGROUND_QUEUES, false, false, TEAM_NEUTRAL);
++            handler->SendErrorMessage("Battleground was created, but teleport failed.");
++            return false;
++        }
++
++        handler->PSendSysMessage("Entering PvP port {} (map {}, instance {}).", bgTypeIdRaw, bg->GetMapId(), bg->GetInstanceID());
++        return true;
++    }
++
+     static bool HandleSkirmishCommand(ChatHandler* handler, std::vector<std::string_view> args)
+     {
+         auto tokens = args;
+diff --git a/src/server/scripts/Spells/spell_dk.cpp b/src/server/scripts/Spells/spell_dk.cpp
+index 32b0034f7..722bfc797 100644
+--- a/src/server/scripts/Spells/spell_dk.cpp
++++ b/src/server/scripts/Spells/spell_dk.cpp
+@@ -551,7 +551,7 @@ class spell_dk_wandering_plague_aura : public AuraScript
+             return;
+ 
+         eventInfo.GetActor()->AddSpellCooldown(SPELL_DK_WANDERING_PLAGUE_TRIGGER, 0, 1000);
+-        eventInfo.GetActor()->CastCustomSpell(SPELL_DK_WANDERING_PLAGUE_TRIGGER, SPELLVALUE_BASE_POINT0, CalculatePct<int32, int32>(eventInfo.GetDamageInfo()->GetDamage(), aurEff->GetAmount()), eventInfo.GetActionTarget(), TRIGGERED_FULL_MASK);
++        eventInfo.GetActor()->CastCustomSpell(SPELL_DK_WANDERING_PLAGUE_TRIGGER, SPELLVALUE_BASE_POINT0, CalculatePct<int32, int32>(eventInfo.GetDamageInfo()->GetDamageForDerivedEffect(), aurEff->GetAmount()), eventInfo.GetActionTarget(), TRIGGERED_FULL_MASK);
+     }
+ 
+     void Register() override
+@@ -2541,7 +2541,7 @@ class spell_dk_unholy_blight : public AuraScript
+         if (!unholyBlight)
+             return;
+ 
+-        int32 bp = CalculatePct(static_cast<int32>(eventInfo.GetDamageInfo()->GetDamage()), aurEff->GetAmount());
++        int32 bp = CalculatePct(static_cast<int32>(eventInfo.GetDamageInfo()->GetDamageForDerivedEffect()), aurEff->GetAmount());
+ 
+         // Glyph of Unholy Blight
+         if (AuraEffect* glyph = caster->GetAuraEffect(SPELL_DK_GLYPH_OF_UNHOLY_BLIGHT, EFFECT_0))
+@@ -2604,7 +2604,7 @@ class spell_dk_necrosis : public AuraScript
+         Unit* caster = GetTarget();
+         Unit* target = eventInfo.GetActionTarget();
+ 
+-        int32 bp = CalculatePct(static_cast<int32>(eventInfo.GetDamageInfo()->GetDamage()), aurEff->GetAmount());
++        int32 bp = CalculatePct(static_cast<int32>(eventInfo.GetDamageInfo()->GetDamageForDerivedEffect()), aurEff->GetAmount());
+         caster->CastCustomSpell(SPELL_DK_NECROSIS_DAMAGE, SPELLVALUE_BASE_POINT0, bp, target, true, nullptr, aurEff);
+     }
+ 
+diff --git a/src/server/scripts/Spells/spell_druid.cpp b/src/server/scripts/Spells/spell_druid.cpp
+index 77e4ac038..c19a18059 100644
+--- a/src/server/scripts/Spells/spell_druid.cpp
++++ b/src/server/scripts/Spells/spell_druid.cpp
+@@ -170,7 +170,7 @@ class spell_dru_t10_balance_4p_bonus : public AuraScript
+ 
+         SpellInfo const* triggeredSpell = sSpellMgr->GetSpellInfo(SPELL_DRUID_LANGUISH);
+ 
+-        int32 amount = CalculatePct(static_cast<int32>(damageInfo->GetDamage()), aurEff->GetAmount()) / triggeredSpell->GetMaxTicks();
++        int32 amount = CalculatePct(static_cast<int32>(damageInfo->GetDamageForDerivedEffect()), aurEff->GetAmount()) / triggeredSpell->GetMaxTicks();
+         eventInfo.GetProcTarget()->CastDelayedSpellWithPeriodicAmount(GetTarget(), SPELL_DRUID_LANGUISH, SPELL_AURA_PERIODIC_DAMAGE, amount, EFFECT_0);
+     }
+ 
+diff --git a/src/server/scripts/Spells/spell_generic.cpp b/src/server/scripts/Spells/spell_generic.cpp
+index 2bb2d19da..2fef9bf47 100644
+--- a/src/server/scripts/Spells/spell_generic.cpp
++++ b/src/server/scripts/Spells/spell_generic.cpp
+@@ -5883,7 +5883,7 @@ class spell_gen_petrified_bark : public AuraScript
+         if (!victim)
+             return;
+ 
+-        int32 damage = damageInfo->GetDamage();
++        int32 damage = damageInfo->GetDamageForDerivedEffect();
+         victim->CastCustomSpell(GetTarget(), 62379, &damage, nullptr, nullptr, true);
+     }
+ 
+@@ -5983,7 +5983,7 @@ class spell_gen_overlords_brand : public AuraScript
+                 return;
+             if (Unit* victim = caster->GetVictim())
+             {
+-                int32 damage = damageInfo->GetDamage();
++                int32 damage = damageInfo->GetDamageForDerivedEffect();
+                 GetTarget()->CastCustomSpell(victim, 69189, &damage, nullptr, nullptr, true);
+             }
+         }
+@@ -6027,7 +6027,7 @@ class spell_gen_overlords_brand_dot : public AuraScript
+                 return;
+             if (Unit* victim = caster->GetVictim())
+             {
+-                int32 damage = damageInfo->GetDamage();
++                int32 damage = damageInfo->GetDamageForDerivedEffect();
+                 GetTarget()->CastCustomSpell(victim, 69189, &damage, nullptr, nullptr, true);
+             }
+         }
+@@ -6091,7 +6091,7 @@ class spell_gen_mirrored_soul : public AuraScript
+         if (!caster)
+             return;
+ 
+-        int32 damage = static_cast<int32>(damageInfo->GetDamage() * 0.45f);
++        int32 damage = static_cast<int32>(damageInfo->GetDamageForDerivedEffect() * 0.45f);
+         if (damage > 0)
+             GetTarget()->CastCustomSpell(caster, 69034, &damage, nullptr, nullptr, true);
+     }
+diff --git a/src/server/scripts/Spells/spell_hunter.cpp b/src/server/scripts/Spells/spell_hunter.cpp
+index ece192038..1045308c7 100644
+--- a/src/server/scripts/Spells/spell_hunter.cpp
++++ b/src/server/scripts/Spells/spell_hunter.cpp
+@@ -1645,7 +1645,7 @@ class spell_hun_piercing_shots : public AuraScript
+         Unit* target = eventInfo.GetActionTarget();
+ 
+         SpellInfo const* piercingShots = sSpellMgr->AssertSpellInfo(SPELL_HUNTER_PIERCING_SHOTS);
+-        int32 bp = CalculatePct(static_cast<int32>(dmgInfo->GetDamage()), aurEff->GetAmount());
++        int32 bp = CalculatePct(static_cast<int32>(dmgInfo->GetDamageForDerivedEffect()), aurEff->GetAmount());
+ 
+         ASSERT(piercingShots->GetMaxTicks() > 0);
+         bp /= piercingShots->GetMaxTicks();
+diff --git a/src/server/scripts/Spells/spell_item.cpp b/src/server/scripts/Spells/spell_item.cpp
+index 3f2a0babc..649c7a881 100644
+--- a/src/server/scripts/Spells/spell_item.cpp
++++ b/src/server/scripts/Spells/spell_item.cpp
+@@ -2173,7 +2173,7 @@ class spell_item_necrotic_touch : public AuraScript
+             return;
+         }
+ 
+-        int32 bp = CalculatePct(static_cast<int32>(damageInfo->GetDamage()), aurEff->GetAmount());
++        int32 bp = CalculatePct(static_cast<int32>(damageInfo->GetDamageForDerivedEffect()), aurEff->GetAmount());
+         GetTarget()->CastCustomSpell(SPELL_ITEM_NECROTIC_TOUCH_PROC, SPELLVALUE_BASE_POINT0, bp, eventInfo.GetProcTarget(), true, nullptr, aurEff);
+     }
+ 
+diff --git a/src/server/scripts/Spells/spell_mage.cpp b/src/server/scripts/Spells/spell_mage.cpp
+index b5f1a6ac7..f16ca96e3 100644
+--- a/src/server/scripts/Spells/spell_mage.cpp
++++ b/src/server/scripts/Spells/spell_mage.cpp
+@@ -737,7 +737,7 @@ class spell_mage_ignite : public AuraScript
+         SpellInfo const* igniteDot = sSpellMgr->AssertSpellInfo(SPELL_MAGE_IGNITE);
+         int32 pct = 8 * GetSpellInfo()->GetRank();
+ 
+-        int32 amount = int32(CalculatePct(eventInfo.GetDamageInfo()->GetDamage(), pct) / igniteDot->GetMaxTicks());
++        int32 amount = int32(CalculatePct(eventInfo.GetDamageInfo()->GetDamageForDerivedEffect(), pct) / igniteDot->GetMaxTicks());
+ 
+         // Xinef: implement ignite bug
+         eventInfo.GetProcTarget()->CastDelayedSpellWithPeriodicAmount(eventInfo.GetActor(), SPELL_MAGE_IGNITE, SPELL_AURA_PERIODIC_DAMAGE, amount);
+diff --git a/src/server/scripts/Spells/spell_paladin.cpp b/src/server/scripts/Spells/spell_paladin.cpp
+index 3c5fe2206..71e762b64 100644
+--- a/src/server/scripts/Spells/spell_paladin.cpp
++++ b/src/server/scripts/Spells/spell_paladin.cpp
+@@ -755,7 +755,7 @@ class spell_pal_eye_for_an_eye : public AuraScript
+         }
+ 
+         // return damage % to attacker but < 50% own total health
+-        int32 damage = std::min(CalculatePct(static_cast<int32>(damageInfo->GetDamage()), aurEff->GetAmount()), static_cast<int32>(GetTarget()->GetMaxHealth()) / 2);
++        int32 damage = std::min(CalculatePct(static_cast<int32>(damageInfo->GetDamageForDerivedEffect()), aurEff->GetAmount()), static_cast<int32>(GetTarget()->GetMaxHealth()) / 2);
+         GetTarget()->CastCustomSpell(SPELL_PALADIN_EYE_FOR_AN_EYE_DAMAGE, SPELLVALUE_BASE_POINT0, damage, eventInfo.GetProcTarget(), true, nullptr, aurEff);
+     }
+ 
+@@ -1282,7 +1282,7 @@ class spell_pal_righteous_vengeance : public AuraScript
+             return;
+ 
+         // Calculate total DoT damage (percentage of crit damage), divided by 4 ticks
+-        int32 amount = CalculatePct(static_cast<int32>(damageInfo->GetDamage()), aurEff->GetAmount()) / 4;
++        int32 amount = CalculatePct(static_cast<int32>(damageInfo->GetDamageForDerivedEffect()), aurEff->GetAmount()) / 4;
+         target->CastDelayedSpellWithPeriodicAmount(GetTarget(), SPELL_PALADIN_RIGHTEOUS_VENGEANCE_DOT, SPELL_AURA_PERIODIC_DAMAGE, amount);
+     }
+ 
+diff --git a/src/server/scripts/Spells/spell_rogue.cpp b/src/server/scripts/Spells/spell_rogue.cpp
+index 302727ca6..34db81adf 100644
+--- a/src/server/scripts/Spells/spell_rogue.cpp
++++ b/src/server/scripts/Spells/spell_rogue.cpp
+@@ -143,7 +143,7 @@ class spell_rog_blade_flurry : public AuraScript
+         DamageInfo* damageInfo = eventInfo.GetDamageInfo();
+         if (procTarget && damageInfo)
+         {
+-            int32 damage = damageInfo->GetUnmitigatedDamage();
++            int32 damage = damageInfo->GetUnmitigatedDamageForDerivedEffect();
+ 
+             CustomSpellValues values;
+             values.AddSpellMod(SPELLVALUE_BASE_POINT0, damage);
+@@ -323,6 +323,23 @@ class spell_rog_killing_spree_aura : public AuraScript
+ 
+     void HandleEffectPeriodic(AuraEffect const* /*aurEff*/)
+     {
++        if (!_primaryTarget.IsEmpty())
++        {
++            if (Unit* target = ObjectAccessor::GetUnit(*GetTarget(), _primaryTarget))
++            {
++                if (GetTarget()->IsValidAttackTarget(target) && !target->HasStealthAura() && !target->HasInvisibilityAura())
++                {
++                    GetTarget()->CastSpell(target, SPELL_ROGUE_KILLING_SPREE_TELEPORT, true);
++                    WorldLocation const& dest = GetTarget()->ToPlayer()->GetTeleportDest();
++                    GetTarget()->ToPlayer()->UpdatePosition(dest, true);
++                    GetTarget()->CastSpell(target, SPELL_ROGUE_KILLING_SPREE_WEAPON_DMG,
++                        TriggerCastFlags(TRIGGERED_FULL_MASK & ~TRIGGERED_DONT_REPORT_CAST_ERROR));
++                    return;
++                }
++            }
++            _primaryTarget.Clear();
++        }
++
+         while (!_targets.empty())
+         {
+             ObjectGuid guid = Acore::Containers::SelectRandomContainerElement(_targets);
+@@ -357,6 +374,8 @@ class spell_rog_killing_spree_aura : public AuraScript
+ public:
+     void AddTarget(Unit* target)
+     {
++        if (GetId() == 86077 && _primaryTarget.IsEmpty())
++            _primaryTarget = target->GetGUID();
+         _targets.push_back(target->GetGUID());
+     }
+ 
+@@ -369,6 +388,7 @@ public:
+ 
+ private:
+     GuidList _targets;
++    ObjectGuid _primaryTarget;
+ };
+ 
+ #define KillingSpreeScriptName "spell_rog_killing_spree"
+@@ -404,7 +424,7 @@ class spell_rog_killing_spree : public SpellScript
+ 
+     void HandleDummy(SpellEffIndex /*effIndex*/)
+     {
+-        if (Aura* aura = GetCaster()->GetAura(SPELL_ROGUE_KILLING_SPREE))
++        if (Aura* aura = GetCaster()->GetAura(GetSpellInfo()->Id))
+         {
+             if (spell_rog_killing_spree_aura* script = dynamic_cast<spell_rog_killing_spree_aura_script*>(aura->GetScriptByName(KillingSpreeScriptName)))
+                 script->AddTarget(GetHitUnit());
+diff --git a/src/server/scripts/Spells/spell_shaman.cpp b/src/server/scripts/Spells/spell_shaman.cpp
+index eef753444..4dda3ab4c 100644
+--- a/src/server/scripts/Spells/spell_shaman.cpp
++++ b/src/server/scripts/Spells/spell_shaman.cpp
+@@ -1442,7 +1442,7 @@ class spell_sha_lightning_overload : public AuraScript
+         if (!damageInfo)
+             return;
+ 
+-        int32 damage = damageInfo->GetDamage();
++        int32 damage = damageInfo->GetDamageForDerivedEffect();
+         // Half damage for critical hits
+         if (eventInfo.GetHitMask() & PROC_EX_CRITICAL_HIT)
+             damage /= 2;
+@@ -2031,7 +2031,7 @@ class spell_sha_t8_elemental_4p_bonus : public AuraScript
+         }
+ 
+         SpellInfo const* electrifiedDot = sSpellMgr->AssertSpellInfo(SPELL_SHAMAN_ELECTRIFIED);
+-        int32 amount = CalculatePct(static_cast<int32>(damageInfo->GetDamage()), aurEff->GetAmount());
++        int32 amount = CalculatePct(static_cast<int32>(damageInfo->GetDamageForDerivedEffect()), aurEff->GetAmount());
+         amount /= electrifiedDot->GetMaxTicks();
+ 
+         eventInfo.GetProcTarget()->CastDelayedSpellWithPeriodicAmount(eventInfo.GetActor(), SPELL_SHAMAN_ELECTRIFIED, SPELL_AURA_PERIODIC_DAMAGE, amount);
+@@ -2065,7 +2065,7 @@ class spell_sha_t9_elemental_4p_bonus : public AuraScript
+         if (!spellInfo)
+             return;
+ 
+-        int32 amount = CalculatePct(static_cast<int32>(damageInfo->GetDamage()), aurEff->GetAmount());
++        int32 amount = CalculatePct(static_cast<int32>(damageInfo->GetDamageForDerivedEffect()), aurEff->GetAmount());
+         amount /= spellInfo->GetMaxTicks();
+ 
+         Unit* caster = eventInfo.GetActor();
+diff --git a/src/server/scripts/Spells/spell_warrior.cpp b/src/server/scripts/Spells/spell_warrior.cpp
+index bd34567d8..2ff8299a4 100644
+--- a/src/server/scripts/Spells/spell_warrior.cpp
++++ b/src/server/scripts/Spells/spell_warrior.cpp
+@@ -15,12 +15,15 @@
+  * with this program. If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include "Group.h"
++#include "GroupReference.h"
+ #include "Player.h"
+ #include "SpellAuraEffects.h"
+ #include "SpellInfo.h"
+ #include "SpellMgr.h"
+ #include "SpellScript.h"
+ #include "SpellScriptLoader.h"
++#include "TemporarySummon.h"
+ /*
+  * Scripts for spells with SPELLFAMILY_WARRIOR and SPELLFAMILY_GENERIC spells used by warrior players.
+  * Ordered alphabetically using scriptname.
+@@ -207,17 +210,25 @@ class spell_warr_improved_spell_reflection_trigger_aura : public AuraScript
+     {
+         if (!IsExpired())
+         {
+-            // aura remove - remove auras from all party members
+-            std::list<Unit*> PartyMembers;
+-            GetUnitOwner()->GetPartyMembers(PartyMembers);
+-            for (std::list<Unit*>::iterator itr = PartyMembers.begin(); itr != PartyMembers.end(); ++itr)
++            // Aura remove - remove auras from all raid members and their active guardians.
++            if (Player* owner = GetUnitOwner()->GetCharmerOrOwnerPlayerOrPlayerItself())
+             {
+-                if ((*itr)->GetGUID() != GetOwner()->GetGUID())
+-                    if (Aura* aur = (*itr)->GetAura(59725, GetCasterGUID()))
++                if (Group* group = owner->GetGroup())
++                {
++                    for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
+                     {
+-                        aur->SetDuration(0);
+-                        aur->Remove();
++                        if (Player* member = itr->GetSource())
++                        {
++                            if (member->GetGUID() != GetOwner()->GetGUID())
++                                member->RemoveAura(59725, GetCasterGUID());
++
++                            if (Guardian* guardian = member->GetGuardianPet())
++                                guardian->RemoveAura(59725, GetCasterGUID());
++                        }
+                     }
++                }
++                else if (Guardian* guardian = owner->GetGuardianPet())
++                    guardian->RemoveAura(59725, GetCasterGUID());
+             }
+         }
+     }
+@@ -686,7 +697,7 @@ class spell_warr_sweeping_strikes : public AuraScript
+                     eventInfo.GetActor()->AddSpellCooldown(SPELL_WARRIOR_SWEEPING_STRIKES_EXTRA_ATTACK_1, 0, 500);
+                 }
+ 
+-                int32 damage = damageInfo->GetUnmitigatedDamage();
++                int32 damage = damageInfo->GetUnmitigatedDamageForDerivedEffect();
+                 GetTarget()->CastCustomSpell(_procTarget, SPELL_WARRIOR_SWEEPING_STRIKES_EXTRA_ATTACK_1, &damage, 0, 0, true, nullptr, aurEff);
+             }
+         }
+diff --git a/src/server/scripts/World/item_scripts.cpp b/src/server/scripts/World/item_scripts.cpp
+index 61df215af..93d590e7c 100644
+--- a/src/server/scripts/World/item_scripts.cpp
++++ b/src/server/scripts/World/item_scripts.cpp
+@@ -16,7 +16,10 @@
+  */
+ 
+ #include "AreaDefines.h"
++#include "Chat.h"
++#include "DBCStores.h"
+ #include "ItemScript.h"
++#include "ObjectMgr.h"
+ #include "Player.h"
+ #include "ScriptedCreature.h"
+ #include "Spell.h"
+@@ -219,6 +222,148 @@ public:
+     }
+ };
+ 
++enum FlightPathMapItems
++{
++    ITEM_COMPLETE_NORTHREND_QUESTS      = 900114,
++    ITEM_FLIGHT_PATHS_NORTHREND         = 900110,
++    ITEM_FLIGHT_PATHS_OUTLAND           = 900111,
++    ITEM_FLIGHT_PATHS_EASTERN_KINGDOMS  = 900112,
++    ITEM_FLIGHT_PATHS_KALIMDOR          = 900113,
++    SPELL_VISUAL_LEARN_SKILL            = 179,
++    SPELL_IMPACT_LEARN_SKILL            = 362
++};
++
++bool IsNorthrendQuest(Quest const* quest)
++{
++    if (!quest)
++        return false;
++
++    switch (quest->GetZoneOrSort())
++    {
++        case 65:
++        case 66:
++        case 67:
++        case 210:
++        case 394:
++        case 495:
++        case 2817:
++        case 3537:
++        case 3711:
++        case 4197:
++        case 4395:
++            return true;
++        default:
++            return false;
++    }
++}
++
++class item_complete_northrend_quests : public ItemScript
++{
++public:
++    item_complete_northrend_quests() : ItemScript("item_complete_northrend_quests") { }
++
++    bool OnUse(Player* player, Item* item, SpellCastTargets const& /*targets*/) override
++    {
++        player->SendEquipError(EQUIP_ERR_NONE, item, nullptr);
++        uint32 completed = 0;
++
++        for (auto const& [questId, quest] : sObjectMgr->GetQuestTemplates())
++        {
++            if (!IsNorthrendQuest(quest) || player->IsQuestRewarded(questId))
++                continue;
++
++            player->SetRewardedQuest(questId);
++            ++completed;
++        }
++
++        if (!completed)
++        {
++            ChatHandler(player->GetSession()).SendNotification("Все задания Нордскола уже выполнены.");
++            return true;
++        }
++
++        player->SendPlaySpellVisual(SPELL_VISUAL_LEARN_SKILL);
++        player->SendPlaySpellImpact(player->GetGUID(), SPELL_IMPACT_LEARN_SKILL);
++        player->DestroyItemCount(item->GetEntry(), 1, true);
++        ChatHandler(player->GetSession()).SendNotification("Отмечено выполненными заданий Нордскола: {}.", completed);
++        return true;
++    }
++};
++
++class item_jestoky_deserter_cleanser : public ItemScript
++{
++public:
++    item_jestoky_deserter_cleanser() : ItemScript("item_jestoky_deserter_cleanser") { }
++
++    bool OnUse(Player* player, Item* item, SpellCastTargets const& /*targets*/) override
++    {
++        player->SendEquipError(EQUIP_ERR_NONE, item, nullptr);
++        player->RemoveAurasDueToSpell(26013);
++        player->RemoveAurasDueToSpell(71041);
++        player->RemoveAurasDueToSpell(71328);
++        player->DestroyItemCount(item->GetEntry(), 1, true);
++        return true;
++    }
++};
++
++class item_unlock_continent_flight_paths : public ItemScript
++{
++public:
++    item_unlock_continent_flight_paths() : ItemScript("item_unlock_continent_flight_paths") { }
++
++    bool OnUse(Player* player, Item* item, SpellCastTargets const& /*targets*/) override
++    {
++        uint32 const itemId = item->GetEntry();
++        TaxiMask const& factionMask = player->GetTeamId() == TEAM_ALLIANCE
++            ? sAllianceTaxiNodesMask : sHordeTaxiNodesMask;
++        uint32 learned = 0;
++
++        for (TaxiNodesEntry const* node : sTaxiNodesStore)
++        {
++            if (!node || !IsNodeOnItemContinent(node, itemId))
++                continue;
++
++            uint8 const field = uint8((node->ID - 1) / 32);
++            uint32 const submask = 1 << ((node->ID - 1) % 32);
++            if ((factionMask[field] & submask) && player->m_taxi.SetTaximaskNode(node->ID))
++                ++learned;
++        }
++
++        if (!learned)
++        {
++            player->SendEquipError(EQUIP_ERR_NONE, item, nullptr);
++            ChatHandler(player->GetSession()).SendNotification("Все доступные маршруты этого континента уже изучены.");
++            return true;
++        }
++
++        player->SendEquipError(EQUIP_ERR_NONE, item, nullptr);
++        player->SendPlaySpellVisual(SPELL_VISUAL_LEARN_SKILL);
++        player->SendPlaySpellImpact(player->GetGUID(), SPELL_IMPACT_LEARN_SKILL);
++        player->DestroyItemCount(itemId, 1, true);
++        ChatHandler(player->GetSession()).SendNotification("Изучено новых маршрутов полета: {}.", learned);
++        return true;
++    }
++
++private:
++    static bool IsNodeOnItemContinent(TaxiNodesEntry const* node, uint32 itemId)
++    {
++        switch (itemId)
++        {
++            case ITEM_FLIGHT_PATHS_NORTHREND:
++                return node->map_id == 571;
++            case ITEM_FLIGHT_PATHS_OUTLAND:
++                return node->map_id == 530 && node->ID != 82 && node->ID != 83 &&
++                    node->ID != 93 && node->ID != 94;
++            case ITEM_FLIGHT_PATHS_EASTERN_KINGDOMS:
++                return node->map_id == 0 || node->ID == 82 || node->ID == 83;
++            case ITEM_FLIGHT_PATHS_KALIMDOR:
++                return node->map_id == 1 || node->ID == 93 || node->ID == 94;
++            default:
++                return false;
++        }
++    }
++};
++
+ void AddSC_item_scripts()
+ {
+     new item_only_for_flight();
+@@ -228,4 +373,7 @@ void AddSC_item_scripts()
+     new item_petrov_cluster_bombs();
+     new item_captured_frog();
+     new item_generic_limit_chance_above_60();
++    new item_complete_northrend_quests();
++    new item_jestoky_deserter_cleanser();
++    new item_unlock_continent_flight_paths();
+ }
