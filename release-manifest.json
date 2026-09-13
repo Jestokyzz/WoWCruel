@@ -1,23 +1,23 @@
 {
-  "version": "1.0.0",
+  "version": "1.0.1",
   "files": [
     {
-      "name": "WoWCruel-bin-v1.0.0.zip",
+      "name": "WoWCruel-bin-v1.0.1.zip",
       "local_name": "WoWCruel-bin-staging.zip",
       "bytes": 30058788,
       "sha256": "872cc9b236f1fd01028bcae84222dd988e6d132d63f0437fa18786b7da00b52b"
     },
     {
-      "name": "WoWCruel-data-v1.0.0.zip",
+      "name": "WoWCruel-data-v1.0.1.zip",
       "local_name": "WoWCruel-data-staging.zip",
       "bytes": 1286591455,
       "sha256": "1a08cea20beda432265174422728de32adae0b3e8d21489850e84cb9e78a2291"
     },
     {
-      "name": "WoWCruel-setup-and-source-v1.0.0.zip",
-      "local_name": "WoWCruel-setup-and-source-v1.0.0.zip",
-      "bytes": 464512311,
-      "sha256": "c5780b71e188f272c10cf13e79fb782926de6af1af04ca86570ec772f9ceba05"
+      "name": "WoWCruel-setup-and-source-v1.0.1.zip",
+      "local_name": "WoWCruel-setup-and-source-v1.0.1.zip",
+      "bytes": 464513121,
+      "sha256": "53cd11c85795e486de263a37a944b3212629352fc7ea8b695d6cfc82b36ba7a0"
     }
   ]
 }
